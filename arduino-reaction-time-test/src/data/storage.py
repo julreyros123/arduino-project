@@ -11,6 +11,7 @@ class ReactionTimeStorage:
         self.create_table()
         self._ensure_participant_column()
         self._ensure_participants_table()
+        self._ensure_profession_column()
 
     def create_table(self):
         with self.connection:
@@ -41,9 +42,20 @@ class ReactionTimeStorage:
                     name TEXT NOT NULL UNIQUE,
                     age INTEGER,
                     gender TEXT,
+                    profession TEXT,
                     registered_at TEXT NOT NULL
                 )
             ''')
+
+    def _ensure_profession_column(self):
+        cursor = self.connection.cursor()
+        cursor.execute("PRAGMA table_info(participants)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if 'profession' not in columns:
+            with self.connection:
+                self.connection.execute(
+                    "ALTER TABLE participants ADD COLUMN profession TEXT"
+                )
 
     def _ensure_parent_directory(self):
         parent_dir = os.path.dirname(self.db_path)
@@ -65,18 +77,20 @@ class ReactionTimeStorage:
 
     # ── Participant registry ──────────────────────────────────────────────────
 
-    def save_participant(self, name: str, age: int, gender: str) -> None:
+    def save_participant(self, name: str, age: int, gender: str,
+                         profession: str = "") -> None:
         """Insert or update a participant record."""
         registered_at = datetime.now().isoformat()
         with self.connection:
             self.connection.execute('''
-                INSERT INTO participants (name, age, gender, registered_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO participants (name, age, gender, profession, registered_at)
+                VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(name) DO UPDATE SET
                     age = excluded.age,
                     gender = excluded.gender,
+                    profession = excluded.profession,
                     registered_at = excluded.registered_at
-            ''', (name, age, gender, registered_at))
+            ''', (name, age, gender, profession or "", registered_at))
 
     def get_all_participants(self):
         """Return all participants ordered by registration date (newest first)."""
@@ -101,6 +115,17 @@ class ReactionTimeStorage:
             WHERE participant_name = ?
         ''', (name,))
         return cursor.fetchone()
+
+    def get_participant_reaction_times(self, name: str):
+        """Return all reaction-time records for a participant, oldest first."""
+        cursor = self.connection.cursor()
+        cursor.execute('''
+            SELECT timestamp, reaction_time
+            FROM reaction_times
+            WHERE participant_name = ?
+            ORDER BY id ASC
+        ''', (name,))
+        return cursor.fetchall()
 
     def close(self):
         self.connection.close()

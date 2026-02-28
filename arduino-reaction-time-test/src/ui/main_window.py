@@ -2,10 +2,11 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from PyQt5.QtCore import QPointF, QRectF, QSize, Qt, QTimer
+from PyQt5.QtCore import QPointF, QRectF, QSize, QStringListModel, Qt, QTimer
 from PyQt5.QtGui import QColor, QPainter, QPainterPath, QPen
 from PyQt5.QtWidgets import (
     QAbstractItemView,
+    QCompleter,
     QComboBox,
     QFrame,
     QGroupBox,
@@ -211,6 +212,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self.populate_serial_ports()
         self.refresh_history()
+        self._refresh_name_completer()
 
     def _build_ui(self):
         self.setWindowTitle("Arduino Reaction-Time Tester")
@@ -280,6 +282,14 @@ class MainWindow(QMainWindow):
         self.name_input.setPlaceholderText("Enter participant name")
         _connect_signal(self.name_input.textChanged, self._on_name_changed)
         _connect_signal(self.name_input.returnPressed, self.register_participant)
+        self._name_completer_model = QStringListModel()
+        self._name_completer = QCompleter(self._name_completer_model, self.name_input)
+        self._name_completer.setCaseSensitivity(Qt.CaseInsensitive)
+        self._name_completer.setFilterMode(Qt.MatchContains)
+        self._name_completer.setCompletionMode(QCompleter.PopupCompletion)
+        # Selecting a suggestion loads the participant directly — no re-registration needed.
+        self._name_completer.activated.connect(self._load_participant_from_registry)
+        self.name_input.setCompleter(self._name_completer)
         setup_layout.addWidget(self.name_input)
 
         self.register_button = QPushButton("Register Participant")
@@ -671,6 +681,11 @@ class MainWindow(QMainWindow):
             self.session_chip.setText("Session: Ready")
             self._set_widget_state(self.session_chip, "neutral")
 
+    def _refresh_name_completer(self) -> None:
+        """Re-populate the name field completer from all registered participants."""
+        names = [p["name"] for p in self.storage.get_all_participants()]
+        self._name_completer_model.setStringList(names)
+
     def _on_name_changed(self):
         typed_name = self.name_input.text().strip()
         if self.current_participant and typed_name != self.current_participant:
@@ -685,21 +700,28 @@ class MainWindow(QMainWindow):
         self._sync_start_button_state()
 
     def register_participant(self):
+        # Always open the dialog — pre-fills existing data if the participant
+        # is already registered so the user can review or update their details.
         prefill = self.name_input.text().strip()
         dlg = RegisterParticipantDialog(self.storage, prefill_name=prefill, parent=self)
         dlg.registered.connect(self._on_participant_registered)
         dlg.exec_()
 
-    def _on_participant_registered(self, name: str, age: int, gender: str) -> None:
+    def _on_participant_registered(self, name: str, age: int, gender: str,
+                                    profession: str) -> None:
         self.name_input.setText(name)
         self.current_participant = name
-        self._set_participant_status(f"Registered: {name} (Age {age}, {gender})", "success")
+        detail = f"Age {age}, {gender}"
+        if profession:
+            detail += f", {profession}"
+        self._set_participant_status(f"Registered: {name} ({detail})", "success")
         self._set_feedback(
             f"{name} is ready. Connect Arduino and start the test.",
             "success",
         )
         self._update_participant_chip()
         self._sync_start_button_state()
+        self._refresh_name_completer()
 
     def _open_participants_window(self) -> None:
         if self._participants_window is None:
@@ -713,19 +735,22 @@ class MainWindow(QMainWindow):
     def _load_participant_from_registry(self, name: str) -> None:
         """Called when the user double-clicks or presses Load in the participants window."""
         participant = self.storage.get_participant(name)
-        age    = int(participant["age"])    if participant and participant["age"]    else 0
-        gender = participant["gender"]      if participant and participant["gender"] else "—"
+        age        = int(participant["age"])    if participant and participant["age"]    else 0
+        gender     = participant["gender"]      if participant and participant["gender"] else "—"
+        profession = participant["profession"]  if participant and participant["profession"] else ""
         self.name_input.setText(name)
         self.current_participant = name
-        self._set_participant_status(
-            f"Loaded: {name} (Age {age}, {gender})", "success"
-        )
+        detail = f"Age {age}, {gender}"
+        if profession:
+            detail += f", {profession}"
+        self._set_participant_status(f"Loaded: {name} ({detail})", "success")
         self._set_feedback(
             f"{name} loaded from registry. Connect Arduino and start the test.",
             "success",
         )
         self._update_participant_chip()
         self._sync_start_button_state()
+        self._refresh_name_completer()
         self.raise_()
         self.activateWindow()
 
@@ -905,12 +930,18 @@ class MainWindow(QMainWindow):
                 f"avg {average_ms:.1f} ms, best {best_ms:.1f} ms, missed {missed_trials}.",
                 "success",
             )
+            # Notify Arduino LCD that session is complete.
+            if self.serial_handler and self.serial_handler.is_connected():
+                avg_int = int(round(average_ms))
+                self.serial_handler.send_data(f"DONE:{avg_int}\n")
         else:
             self._set_signal_state("warning", "COMPLETE", "No valid response captured.")
             self._set_feedback(
                 f"{participant_name} done: no valid reaction captured in {SESSION_TRIALS} trials.",
                 "warning",
             )
+            if self.serial_handler and self.serial_handler.is_connected():
+                self.serial_handler.send_data("DONE:0\n")
 
     def poll_serial_data(self):
         if not (self.serial_handler and self.serial_handler.is_connected()):
@@ -956,8 +987,13 @@ class MainWindow(QMainWindow):
             self._sync_start_button_state()
             return
         if value in {"EARLY", "TOO_SOON"}:
-            self._set_signal_state("danger", "EARLY", "Button pressed too soon.")
-            self._set_feedback("Early press detected. Wait for GO signal.", "danger")
+            self._set_signal_state("danger", "EARLY", "False start — wait for GO.")
+            self._set_feedback(
+                f"Trial {self.current_trial}/{SESSION_TRIALS}: false start! "
+                "Arduino is re-arming — wait for GO signal.",
+                "danger",
+            )
+            # test_in_progress stays True; Arduino will send ARMED again to re-arm.
             return
         if value == "CANCELLED":
             self.test_in_progress = False
