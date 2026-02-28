@@ -17,6 +17,7 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QTabWidget,
     QTableWidget,
@@ -114,6 +115,7 @@ class SignalWidget(QWidget):
         super().__init__(parent)
         self._state = "idle"
         self._title = "READY"
+        self._subtitle = "-- ms"
         self._colors = {
             "idle": QColor("#1E88E5"),
             "ready": QColor("#2196F3"),
@@ -123,16 +125,20 @@ class SignalWidget(QWidget):
             "success": QColor("#90A4AE"),
         }
         self.setObjectName("SignalWidget")
-        self.setMinimumSize(170, 170)
+        self.setMinimumSize(180, 180)
         self.setMaximumSize(220, 220)
 
     def sizeHint(self):
-        return QSize(190, 190)
+        return QSize(200, 200)
 
     def set_state(self, state, title=None):
         self._state = state if state in self._colors else "idle"
         if title is not None:
             self._title = title
+        self.update()
+
+    def set_subtitle(self, text):
+        self._subtitle = text if text is not None else "-- ms"
         self.update()
 
     def paintEvent(self, event):
@@ -155,12 +161,31 @@ class SignalWidget(QWidget):
         painter.setPen(QPen(border, 4))
         painter.drawEllipse(circle)
 
+        # State title in upper-centre of circle
+        title_rect = QRectF(circle.left(), circle.top(), circle.width(), circle.height() * 0.56)
         painter.setPen(QPen(QColor("#0f3559"), 1))
         title_font = painter.font()
         title_font.setBold(True)
         title_font.setPointSize(18)
         painter.setFont(title_font)
-        painter.drawText(circle, Qt.AlignCenter, self._title)
+        painter.drawText(title_rect, Qt.AlignCenter | Qt.AlignBottom, self._title)
+
+        # Divider line inside circle
+        cx = int(circle.center().x())
+        cy = int(circle.center().y()) + 4
+        half_w = int(circle.width() * 0.28)
+        painter.setPen(QPen(QColor("#0f3559"), 1, Qt.SolidLine))
+        painter.setOpacity(0.25)
+        painter.drawLine(cx - half_w, cy, cx + half_w, cy)
+        painter.setOpacity(1.0)
+
+        # Subtitle in lower-centre of circle
+        sub_rect = QRectF(circle.left(), circle.top() + circle.height() * 0.54, circle.width(), circle.height() * 0.44)
+        sub_font = painter.font()
+        sub_font.setBold(True)
+        sub_font.setPointSize(13)
+        painter.setFont(sub_font)
+        painter.drawText(sub_rect, Qt.AlignCenter | Qt.AlignTop, self._subtitle)
 
 
 class MainWindow(QMainWindow):
@@ -185,27 +210,32 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self):
         self.setWindowTitle("Arduino Reaction-Time Tester")
-        self.resize(1240, 860)
-        self.setMinimumSize(1080, 760)
+        self.setMinimumSize(900, 600)
+        self.showMaximized()
 
         central_widget = QWidget(self)
         central_widget.setObjectName("MainContainer")
         self.setCentralWidget(central_widget)
 
         root_layout = QVBoxLayout()
-        root_layout.setSpacing(14)
-        root_layout.setContentsMargins(16, 16, 16, 16)
+        root_layout.setSpacing(8)
+        root_layout.setContentsMargins(10, 8, 10, 8)
         central_widget.setLayout(root_layout)
 
+        # ── Header ────────────────────────────────────────────────────────────
         status_strip = QFrame()
         status_strip.setObjectName("StatusStrip")
-        status_strip.setMinimumHeight(52)
+        status_strip.setFixedHeight(46)
         status_strip.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         status_layout = QHBoxLayout()
-        status_layout.setContentsMargins(12, 8, 12, 8)
+        status_layout.setContentsMargins(14, 4, 14, 4)
         status_layout.setSpacing(10)
         status_strip.setLayout(status_layout)
         root_layout.addWidget(status_strip)
+
+        status_icon = QLabel("⚡")
+        status_icon.setObjectName("StatusIcon")
+        status_layout.addWidget(status_icon)
 
         status_title = QLabel("Reaction-Time Assessment")
         status_title.setObjectName("StatusTitle")
@@ -224,20 +254,22 @@ class MainWindow(QMainWindow):
         self.session_chip.setObjectName("StatusChip")
         status_layout.addWidget(self.session_chip)
 
+        # ── Body: left (setup) + right (reaction test) ────────────────────────
         body_layout = QHBoxLayout()
-        body_layout.setSpacing(14)
-        root_layout.addLayout(body_layout, stretch=6)
+        body_layout.setSpacing(10)
+        body_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.addLayout(body_layout)
 
+        # ── Left: Session Setup ───────────────────────────────────────────────
         setup_group = QGroupBox("Session Setup")
         setup_group.setObjectName("SectionCard")
-        setup_group.setMinimumWidth(300)
-        setup_group.setMaximumWidth(360)
-        setup_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        setup_group.setFixedWidth(310)
+        setup_group.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
         setup_layout = QVBoxLayout()
-        setup_layout.setContentsMargins(14, 20, 14, 14)
+        setup_layout.setContentsMargins(12, 12, 12, 12)
         setup_layout.setSpacing(10)
         setup_group.setLayout(setup_layout)
-        body_layout.addWidget(setup_group, stretch=3)
+        body_layout.addWidget(setup_group)
 
         setup_layout.addWidget(QLabel("Participant Name"))
         self.name_input = QLineEdit()
@@ -250,6 +282,16 @@ class MainWindow(QMainWindow):
         self.register_button.setObjectName("SecondaryButton")
         _connect_signal(self.register_button.clicked, self.register_participant)
         setup_layout.addWidget(self.register_button)
+
+        self.participant_status = QLabel()
+        self.participant_status.setObjectName("InlineStatus")
+        self.participant_status.setMinimumHeight(26)
+        setup_layout.addWidget(self.participant_status)
+
+        setup_divider = QFrame()
+        setup_divider.setFrameShape(QFrame.HLine)
+        setup_divider.setObjectName("SetupDivider")
+        setup_layout.addWidget(setup_divider)
 
         setup_layout.addWidget(QLabel("Serial Port"))
         self.port_select = QComboBox()
@@ -269,66 +311,74 @@ class MainWindow(QMainWindow):
         _connect_signal(self.connect_button.clicked, self.toggle_serial_connection)
         serial_btn_row.addWidget(self.connect_button)
 
-        self.participant_status = QLabel()
-        self.participant_status.setObjectName("InlineStatus")
-        self.participant_status.setMinimumHeight(26)
-        setup_layout.addWidget(self.participant_status)
-
         self.connection_status = QLabel()
         self.connection_status.setObjectName("InlineStatus")
         self.connection_status.setMinimumHeight(26)
         setup_layout.addWidget(self.connection_status)
         setup_layout.addStretch(1)
 
+        # ── Right: Reaction Test ──────────────────────────────────────────────
         reaction_group = QGroupBox("Reaction Test")
         reaction_group.setObjectName("MainTestCard")
-        reaction_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        reaction_group.setMinimumHeight(420)
+        reaction_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         reaction_layout = QVBoxLayout()
-        reaction_layout.setContentsMargins(18, 22, 18, 16)
+        reaction_layout.setContentsMargins(12, 12, 12, 12)
         reaction_layout.setSpacing(10)
         reaction_group.setLayout(reaction_layout)
-        body_layout.addWidget(reaction_group, stretch=7)
+        body_layout.addWidget(reaction_group, stretch=1)
 
+        # Circle + reading panel side by side
         signal_container = QWidget()
         signal_container_layout = QHBoxLayout()
         signal_container_layout.setContentsMargins(0, 0, 0, 0)
-        signal_container_layout.setSpacing(4)
+        signal_container_layout.setSpacing(24)
         signal_container.setLayout(signal_container_layout)
-        signal_container.setMinimumHeight(220)
-        signal_container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         reaction_layout.addWidget(signal_container)
 
+        signal_container_layout.addStretch(1)
+
         self.signal_widget = SignalWidget()
-        self.signal_widget.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.signal_widget.setFixedSize(200, 200)
         signal_container_layout.addWidget(self.signal_widget, alignment=Qt.AlignCenter)
+
+        reading_panel = QWidget()
+        reading_panel.setObjectName("ReadingPanel")
+        reading_panel_layout = QVBoxLayout()
+        reading_panel_layout.setContentsMargins(12, 0, 0, 0)
+        reading_panel_layout.setSpacing(8)
+        reading_panel.setLayout(reading_panel_layout)
+        signal_container_layout.addWidget(reading_panel, stretch=2)
+
+        reading_panel_layout.addStretch(1)
 
         self.live_result_value = QLabel("-- ms")
         self.live_result_value.setObjectName("LiveResultValue")
-        self.live_result_value.setAlignment(Qt.AlignCenter)
-        self.live_result_value.setMinimumHeight(44)
-        reaction_layout.addWidget(self.live_result_value)
+        self.live_result_value.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        reading_panel_layout.addWidget(self.live_result_value)
 
         self.live_result_hint = QLabel("Waiting...")
         self.live_result_hint.setObjectName("LiveResultHint")
-        self.live_result_hint.setAlignment(Qt.AlignCenter)
-        self.live_result_hint.setMinimumHeight(24)
-        reaction_layout.addWidget(self.live_result_hint)
+        self.live_result_hint.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        reading_panel_layout.addWidget(self.live_result_hint)
 
+        reading_panel_layout.addStretch(1)
+        signal_container_layout.addStretch(1)
+
+        # Buttons
         button_row = QHBoxLayout()
-        button_row.setSpacing(12)
+        button_row.setSpacing(10)
         reaction_layout.addLayout(button_row)
 
         self.start_button = QPushButton("START TEST")
         self.start_button.setObjectName("PrimaryActionButton")
         _connect_signal(self.start_button.clicked, self.start_test)
-        self.start_button.setMinimumHeight(42)
+        self.start_button.setFixedHeight(36)
         button_row.addWidget(self.start_button, stretch=1)
 
         self.stop_button = QPushButton("END SESSION")
         self.stop_button.setObjectName("DangerButton")
         _connect_signal(self.stop_button.clicked, self.stop_test)
-        self.stop_button.setMinimumHeight(42)
+        self.stop_button.setFixedHeight(36)
         button_row.addWidget(self.stop_button, stretch=1)
 
         self.trial_progress = QProgressBar()
@@ -336,39 +386,50 @@ class MainWindow(QMainWindow):
         self.trial_progress.setRange(0, SESSION_TRIALS)
         self.trial_progress.setValue(0)
         self.trial_progress.setTextVisible(True)
-        self.trial_progress.setMinimumHeight(24)
+        self.trial_progress.setFixedHeight(22)
         reaction_layout.addWidget(self.trial_progress)
 
         self.feedback_label = QLabel()
         self.feedback_label.setObjectName("FeedbackPanel")
         self.feedback_label.setWordWrap(True)
         self.feedback_label.setAlignment(Qt.AlignCenter)
-        self.feedback_label.setMinimumHeight(44)
         self.feedback_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         reaction_layout.addWidget(self.feedback_label)
 
+        # ── Scrollable lower section (Summary + Tabs) ─────────────────────────
+        scroll_area = QScrollArea()
+        scroll_area.setObjectName("LowerScrollArea")
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        root_layout.addWidget(scroll_area, stretch=1)
+
+        scroll_content = QWidget()
+        scroll_content.setObjectName("LowerContent")
+        scroll_layout = QVBoxLayout()
+        scroll_layout.setContentsMargins(0, 0, 0, 0)
+        scroll_layout.setSpacing(8)
+        scroll_content.setLayout(scroll_layout)
+        scroll_area.setWidget(scroll_content)
+
+        # Session Summary
         summary_group = QGroupBox("Session Summary")
         summary_group.setObjectName("SectionCard")
-        summary_group.setMinimumHeight(200)
         summary_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         summary_layout = QVBoxLayout()
-        summary_layout.setContentsMargins(14, 22, 14, 14)
-        summary_layout.setSpacing(12)
+        summary_layout.setContentsMargins(12, 12, 12, 12)
+        summary_layout.setSpacing(8)
         summary_group.setLayout(summary_layout)
-        root_layout.addWidget(summary_group, stretch=3)
+        scroll_layout.addWidget(summary_group)
 
         metric_row = QHBoxLayout()
-        metric_row.setSpacing(12)
+        metric_row.setSpacing(10)
         summary_layout.addLayout(metric_row)
 
         total_card, self.total_trials_value = self._create_metric_card("Total", "0")
         avg_card, self.average_value = self._create_metric_card("Average", "--")
         best_card, self.best_value = self._create_metric_card("Best", "--")
         worst_card, self.worst_value = self._create_metric_card("Worst", "--")
-        total_card.setMinimumHeight(92)
-        avg_card.setMinimumHeight(92)
-        best_card.setMinimumHeight(92)
-        worst_card.setMinimumHeight(92)
         metric_row.addWidget(total_card, stretch=1)
         metric_row.addWidget(avg_card, stretch=1)
         metric_row.addWidget(best_card, stretch=1)
@@ -384,16 +445,17 @@ class MainWindow(QMainWindow):
         self.interpretation_label.setWordWrap(True)
         summary_layout.addWidget(self.interpretation_label)
 
+        # Trend / History Tabs
         tabs = QTabWidget()
         tabs.setObjectName("DataTabs")
         tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        tabs.setMinimumHeight(240)
-        root_layout.addWidget(tabs, stretch=4)
+        tabs.setMinimumHeight(200)
+        scroll_layout.addWidget(tabs)
 
         trend_tab = QWidget()
         trend_layout = QVBoxLayout()
         trend_layout.setContentsMargins(10, 10, 10, 10)
-        trend_layout.setSpacing(10)
+        trend_layout.setSpacing(8)
         trend_tab.setLayout(trend_layout)
 
         self.trend_graph = ReactionTrendWidget()
@@ -408,7 +470,7 @@ class MainWindow(QMainWindow):
         history_tab = QWidget()
         history_layout = QVBoxLayout()
         history_layout.setContentsMargins(10, 10, 10, 10)
-        history_layout.setSpacing(10)
+        history_layout.setSpacing(8)
         history_tab.setLayout(history_layout)
 
         self.history_table = QTableWidget(0, 4)
@@ -487,8 +549,11 @@ class MainWindow(QMainWindow):
     def _set_live_result(self, reaction_ms, state, subtitle):
         if reaction_ms is None:
             self.live_result_value.setText("-- ms")
+            self.signal_widget.set_subtitle("-- ms")
         else:
-            self.live_result_value.setText(f"{reaction_ms:.1f} ms")
+            ms_text = f"{reaction_ms:.1f} ms"
+            self.live_result_value.setText(ms_text)
+            self.signal_widget.set_subtitle(ms_text)
         self.live_result_hint.setText(subtitle)
         self._set_widget_state(self.live_result_value, state)
 
