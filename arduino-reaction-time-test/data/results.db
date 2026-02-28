@@ -1,0 +1,3 @@
+The file data/results.db is an SQLite database file and should be created as an empty database. Here are the contents for that file:
+
+# This file is intentionally left blank.
