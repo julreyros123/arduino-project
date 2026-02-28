@@ -6,7 +6,26 @@
 // =====================================================================
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
-#include "config.h"
+
+// ===== PIN CONFIG =====
+#define BUTTON_PIN    3     // Reaction button (INPUT_PULLUP — LOW = pressed)
+#define LED_PIN       2     // GO indicator LED
+#define BUZZER_PIN    4     // Auditory GO signal
+
+// ===== LCD (I2C) =====
+#define LCD_ADDR      0x27
+#define LCD_COLS      16
+#define LCD_ROWS      2
+
+// ===== TEST CONFIG =====
+const int           NUM_TESTS        = 5;
+const unsigned long TIMEOUT_MS       = 5000;   // Max wait for reaction (ms)
+const unsigned long MIN_DELAY_MS     = 1000;   // Min random pre-GO delay (ms)
+const unsigned long MAX_DELAY_MS     = 3000;   // Max random pre-GO delay (ms)
+// Buzzer stays ON throughout WAITING_FOR_PRESS; stopTest() turns it off.
+
+// ===== SERIAL =====
+#define SERIAL_BAUD_RATE 9600
 
 // ── LCD ──────────────────────────────────────────────────────────────
 LiquidCrystal_I2C lcd(LCD_ADDR, LCD_COLS, LCD_ROWS);
@@ -67,17 +86,19 @@ void armTrial() {
   Serial.println(F("ARMED"));
 }
 
-// Fire the GO signal: LED on, short buzz, update LCD, notify Python.
+// Fire the GO signal: LED on, buzzer on (stays on until press/timeout), update LCD, notify Python.
 void triggerGo() {
-  reactionStartMs = millis();
   state = WAITING_FOR_PRESS;
 
+  // Activate stimulus – buzzer stays ON until stopTest() turns it off.
   digitalWrite(LED_PIN,    HIGH);
   digitalWrite(BUZZER_PIN, HIGH);
-  delay(BUZZ_DURATION_MS);
-  digitalWrite(BUZZER_PIN, LOW);
 
   lcdShow(">> GO! <<", "Press button now");
+
+  // Start the reaction clock AFTER the stimulus is fully visible/audible
+  // so the measured time reflects true user response latency.
+  reactionStartMs = millis();
   Serial.println(F("GO"));
 }
 
@@ -97,6 +118,27 @@ void stopTest(bool resetSession = false) {
 void handleCommand(const String& cmd) {
   if (cmd.length() == 0) return;
 
+  // "PING" — Python requests a handshake confirmation (used after Bluetooth connect
+  // where the Arduino does not reset and the boot-time HELLO was already missed).
+  if (cmd == "PING") {
+    Serial.println(F("HELLO"));
+    lcdShow("PC Connected!", "  Ready to start");
+    return;
+  }
+
+  // "BEGIN:name" — Python started a session; show participant name on LCD.
+  // No response needed; Python sends "S" immediately after.
+  if (cmd.startsWith("BEGIN:")) {
+    String pName = cmd.substring(6);
+    pName.trim();
+    if (pName.length() > 16) pName = pName.substring(0, 16);
+    char nameBuf[17];
+    pName.toCharArray(nameBuf, sizeof(nameBuf));
+    lcdShow(nameBuf, "   Session Start");
+    trialNumber = 0;   // reset trial counter for new session
+    return;
+  }
+
   // "S" — start the next trial in the current session
   if (cmd == "S") {
     if (state != IDLE) {
@@ -111,8 +153,20 @@ void handleCommand(const String& cmd) {
   // "X" — abort / cancel the current session
   if (cmd == "X") {
     stopTest(true);   // reset trial counter too
-    lcdShow("Cancelled", "");
+    lcdShow("  RT Tester  ", " Waiting PC...");
     Serial.println(F("CANCELLED"));
+    return;
+  }
+
+  // "RESULT:rt" — PC keyboard captured the reaction; show result on LCD
+  // and return to IDLE (mirrors what the hardware button path does).
+  if (cmd.startsWith("RESULT:")) {
+    unsigned long rt = cmd.substring(7).toInt();
+    digitalWrite(LED_PIN, LOW);
+    char rtLine[17];
+    snprintf(rtLine, sizeof(rtLine), "RT: %lu ms", rt);
+    lcdShow(rtLine, getCategory(rt));
+    stopTest();   // back to IDLE; trialNumber kept
     return;
   }
 
@@ -144,7 +198,10 @@ void setup() {
 
   lcd.init();
   lcd.backlight();
-  lcdShow("  RT Tester  ", "  Ready...   ");
+  // Show waiting message — the test ONLY starts when Python sends "S".
+  lcdShow("  RT Tester  ", " Waiting PC...");
+  // Announce readiness to Python so it can confirm the handshake.
+  Serial.println(F("HELLO"));
 
   randomSeed(analogRead(A0) ^ micros());
 }

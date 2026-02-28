@@ -184,6 +184,14 @@ QPushButton#PrimaryActionButton {
     padding: 7px 14px;
 }
 
+QPushButton#PrimaryButton:disabled,
+QPushButton#PrimaryActionButton:disabled {
+    background-color: #a8c4e0;
+    color: #dceaf7;
+    border-color: #88aace;
+    font-weight: 800;
+}
+
 QPushButton#DangerButton {
     background-color: #fff1f0;
     border-color: #e8b0ae;

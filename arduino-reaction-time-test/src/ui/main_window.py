@@ -1,4 +1,6 @@
 import sys
+import time
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -202,11 +204,21 @@ class MainWindow(QMainWindow):
         self.current_trial = 0
         self.session_results = []
         self.latest_reaction_ms: Optional[float] = None
+        self._current_session_id: Optional[str] = None
+        self._go_received_at: Optional[float] = None   # time.monotonic() when GO arrived
 
         self.serial_poll_timer = QTimer(self)
         self.serial_poll_timer.setInterval(50)
         _connect_signal(self.serial_poll_timer.timeout, self.poll_serial_data)
 
+        # Retry PING every 2 s until HELLO is received (handles Bluetooth latency
+        # where the one-shot PING sent at connect is sometimes missed).
+        self._ping_retry_timer = QTimer(self)
+        self._ping_retry_timer.setInterval(2000)
+        _connect_signal(self._ping_retry_timer.timeout, self._retry_ping)
+        self._ping_retry_count = 0
+
+        self._arduino_ready = False   # True only after HELLO handshake received
         self._participants_window = None   # lazy-created
 
         self._build_ui()
@@ -400,6 +412,13 @@ class MainWindow(QMainWindow):
         self.stop_button.setFixedHeight(36)
         button_row.addWidget(self.stop_button, stretch=1)
 
+        # Dynamic hint shown when START TEST is disabled
+        self.start_hint_label = QLabel()
+        self.start_hint_label.setObjectName("InlineStatus")
+        self.start_hint_label.setAlignment(Qt.AlignCenter)
+        self.start_hint_label.setFixedHeight(26)
+        reaction_layout.addWidget(self.start_hint_label)
+
         self.trial_progress = QProgressBar()
         self.trial_progress.setObjectName("TrialProgress")
         self.trial_progress.setRange(0, SESSION_TRIALS)
@@ -492,9 +511,9 @@ class MainWindow(QMainWindow):
         history_layout.setSpacing(8)
         history_tab.setLayout(history_layout)
 
-        self.history_table = QTableWidget(0, 4)
+        self.history_table = QTableWidget(0, 5)
         self.history_table.setObjectName("HistoryTable")
-        self.history_table.setHorizontalHeaderLabels(["Timestamp", "Participant", "Reaction (ms)", "Category"])
+        self.history_table.setHorizontalHeaderLabels(["Timestamp", "Participant", "Avg (ms)", "Trials", "Category"])
         self.history_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.history_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.history_table.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -505,6 +524,7 @@ class MainWindow(QMainWindow):
         self.history_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.history_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.history_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.history_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
         history_layout.addWidget(self.history_table)
         tabs.addTab(history_tab, "History")
 
@@ -794,11 +814,14 @@ class MainWindow(QMainWindow):
             self.serial_handler.disconnect()
             self.serial_handler = None
             self.serial_poll_timer.stop()
+            self._ping_retry_timer.stop()
+            self._arduino_ready = False
             self.session_active = False
             self.test_in_progress = False
             self.current_trial = 0
             self.session_results = []
             self.latest_reaction_ms = None
+            self._go_received_at = None
             self.connect_button.setText("Connect")
             self._set_connection_status("Status: Not connected", "warning")
             self._set_feedback("Arduino disconnected.", "warning")
@@ -821,16 +844,37 @@ class MainWindow(QMainWindow):
             self.connect_button.setText("Disconnect")
             self.serial_poll_timer.start()
             self._set_connection_status(f"Status: Connected to {selected_port}", "success")
-            self._set_feedback("Arduino connected. Press START TEST when ready.", "success")
-            self._set_signal_state("idle", "READY", "Connected and waiting to start.")
+            self._set_feedback(
+                "Arduino connected — waiting for handshake…", "active"
+            )
+            # Wait 2 s for Bluetooth/USB to stabilise, then send the first PING.
+            # The retry timer will keep sending every 2 s until HELLO arrives.
+            self._ping_retry_count = 0
+            self._ping_retry_timer.start()
+            QTimer.singleShot(2000, self._send_initial_ping)
+            self._set_signal_state("idle", "READY", "Waiting for Arduino handshake…")
             self._update_connection_chip()
             self._sync_start_button_state()
         else:
-            QMessageBox.critical(
-                self,
-                "Serial",
-                f"Unable to open {selected_port}. Check the Arduino connection and try again.",
-            )
+            err = handler.last_error.lower()
+            if "access is denied" in err or "permiss" in err or "in use" in err:
+                detail = (
+                    f"{selected_port} is already in use by another program.\n\n"
+                    "Most likely cause: Arduino IDE Serial Monitor is open.\n"
+                    "Fix: Close the Serial Monitor (or Arduino IDE), then click Connect again."
+                )
+            else:
+                detail = (
+                    f"Unable to open {selected_port}.\n\n"
+                    "Tip: Make sure Arduino IDE Serial Monitor is closed, "
+                    "the USB cable is plugged in, and the correct port is selected."
+                )
+            QMessageBox.critical(self, "Serial — Port Unavailable", detail)
+
+    def _send_initial_ping(self):
+        """Send the first PING after the stabilisation delay."""
+        if self.serial_handler and self.serial_handler.is_connected() and not self._arduino_ready:
+            self.serial_handler.send_data("PING\n")
 
     def start_test(self):
         participant_name = self.name_input.text().strip()
@@ -846,6 +890,15 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Serial", "Please connect to Arduino before starting.")
             return
 
+        if not self._arduino_ready:
+            QMessageBox.warning(
+                self,
+                "Arduino Not Ready",
+                "Arduino has not finished initialising yet.\n"
+                "Wait for the \"Arduino is ready\" message before starting.",
+            )
+            return
+
         if self.session_active or self.test_in_progress:
             return
 
@@ -854,13 +907,20 @@ class MainWindow(QMainWindow):
         self.current_trial = 0
         self.session_results = []
         self.latest_reaction_ms = None
+        self._go_received_at = None
+        self._current_session_id = str(uuid.uuid4())
         self._set_live_result(None, "active", "Session started")
         self._set_signal_state("ready", "READY", "Waiting for random stimulus...")
         self._set_feedback(f"Session started for {participant_name}. Get ready for trial 1.", "active")
         self._update_trial_status()
         self._update_session_chip()
         self._sync_start_button_state()
-        self._start_next_trial()
+        # Tell Arduino who the participant is and that the session has begun.
+        # Arduino will show the name on LCD; delay 800 ms before first S so
+        # the participant name / Session Start screen is visible briefly.
+        safe_name = participant_name[:16].replace("\n", "").replace("\r", "")
+        self.serial_handler.send_data(f"BEGIN:{safe_name}\n")
+        QTimer.singleShot(800, self._start_next_trial)
 
     def stop_test(self):
         if not (self.serial_handler and self.serial_handler.is_connected()):
@@ -910,6 +970,7 @@ class MainWindow(QMainWindow):
         self.current_trial = 0
         completed_results = list(self.session_results)
         self.session_results = []
+        self._current_session_id = None
         self._update_trial_status()
         self._update_session_chip()
         self._sync_start_button_state()
@@ -946,18 +1007,61 @@ class MainWindow(QMainWindow):
     def poll_serial_data(self):
         if not (self.serial_handler and self.serial_handler.is_connected()):
             return
+        try:
+            for _ in range(20):
+                payload = self.serial_handler.receive_data()
+                if not payload:
+                    break
+                self._handle_serial_message(payload)
+        except Exception:
+            # Silently ignore transient serial errors during polling;
+            # the next tick will retry or the disconnect handler will fire.
+            pass
 
-        for _ in range(20):
-            payload = self.serial_handler.receive_data()
-            if not payload:
-                break
-            self._handle_serial_message(payload)
+    def _retry_ping(self):
+        """Resend PING every 2 s until Arduino replies with HELLO.
+        After 5 retries (~10 s) with no response, force-enable the start
+        button so a Bluetooth latency or missed-HELLO issue can't lock the
+        user out permanently."""
+        if self._arduino_ready:
+            self._ping_retry_timer.stop()
+            return
+        if not (self.serial_handler and self.serial_handler.is_connected()):
+            self._ping_retry_timer.stop()
+            return
+        self._ping_retry_count += 1
+        self.serial_handler.send_data("PING\n")
+        if self._ping_retry_count >= 5:
+            # No HELLO after ~10 s - Arduino firmware is likely running but the
+            # Bluetooth layer dropped the response.  Treat as ready so the user
+            # isn't permanently blocked.
+            self._ping_retry_timer.stop()
+            self._arduino_ready = True
+            self._set_connection_status("Status: Arduino ready (fallback)", "success")
+            self._set_feedback(
+                "Arduino ready (handshake timed out — proceeding). Press START TEST.",
+                "success",
+            )
+            self._set_signal_state("idle", "READY", "Waiting for START TEST button.")
+            self._sync_start_button_state()
 
     def _handle_serial_message(self, message):
         value = message.strip()
         if not value:
             return
 
+        if value == "HELLO":
+            self._arduino_ready = True
+            self._ping_retry_timer.stop()   # handshake complete — stop retrying
+            self._set_connection_status(
+                f"Status: Arduino ready", "success"
+            )
+            self._set_feedback(
+                "Arduino is ready and waiting. Press START TEST to begin.", "success"
+            )
+            self._set_signal_state("idle", "READY", "Waiting for START TEST button.")
+            self._sync_start_button_state()
+            return
         if value == "ARMED":
             self._set_signal_state("ready", "READY", "Wait for GO signal.")
             self._set_feedback(
@@ -966,14 +1070,26 @@ class MainWindow(QMainWindow):
             )
             return
         if value == "GO":
-            self._set_signal_state("go", "GO", "Press the hardware button now.")
+            self._go_received_at = time.monotonic()   # start PC-side reaction clock
+            self._set_signal_state("go", "GO", "Press the hardware button — or Enter / Space key.")
             self._set_feedback(
-                f"Trial {self.current_trial}/{SESSION_TRIALS}: GO! Press the hardware button now.",
+                f"Trial {self.current_trial}/{SESSION_TRIALS}: GO! "
+                "Press the Arduino button  OR  hit Enter / Space on the keyboard.",
                 "warning",
+            )
+            return
+        if value == "PRESSED":
+            # Hardware button detected — clear PC clock so keyboard can't double-record
+            self._go_received_at = None
+            self._set_signal_state("active", "PRESSED!", "Button detected…")
+            self._set_feedback(
+                f"Trial {self.current_trial}/{SESSION_TRIALS}: button press detected! Recording…",
+                "active",
             )
             return
         if value == "TIMEOUT":
             self.test_in_progress = False
+            self._go_received_at = None
             self.session_results.append(None)
             self._set_signal_state("warning", "MISSED", "No response captured in time.")
             self._set_feedback(
@@ -997,6 +1113,7 @@ class MainWindow(QMainWindow):
             return
         if value == "CANCELLED":
             self.test_in_progress = False
+            self._go_received_at = None
             self._set_signal_state("danger", "STOPPED", "Session cancelled.")
             self._set_feedback("Test cancelled.", "danger")
             self._finish_session(aborted=True)
@@ -1016,7 +1133,7 @@ class MainWindow(QMainWindow):
             return
 
         participant_name = self.current_participant or self.name_input.text().strip() or "Unknown"
-        self.storage.save_reaction_time(participant_name, reaction_time_ms)
+        self.storage.save_reaction_time(participant_name, reaction_time_ms, self._current_session_id)
         self.latest_reaction_ms = reaction_time_ms
         category, _category_state, _ = self._classify_reaction(reaction_time_ms)
         self._set_signal_state("success", "RECORDED", f"{reaction_time_ms:.1f} ms ({category})")
@@ -1048,33 +1165,54 @@ class MainWindow(QMainWindow):
         return parsed
 
     def refresh_history(self):
-        rows = self.storage.get_all_reaction_times()
-        self.history_table.setRowCount(len(rows))
-        all_reactions = []
-        for row_idx, record in enumerate(rows):
+        # History table: one row per session (grouped average)
+        sessions = self.storage.get_session_averages()
+        self.history_table.setRowCount(len(sessions))
+        for row_idx, record in enumerate(sessions):
             if hasattr(record, "keys"):
-                timestamp = record["timestamp"]
+                timestamp  = record["timestamp"]
                 participant = record["participant_name"]
-                reaction = float(record["reaction_time"])
+                avg_rt      = float(record["avg_rt"])
+                trial_count = int(record["trial_count"])
             else:
-                timestamp = record[1]
-                participant = record[2]
-                reaction = float(record[3])
-            all_reactions.append(reaction)
-            category, _, _ = self._classify_reaction(reaction)
+                timestamp   = record[0]
+                participant = record[1]
+                avg_rt      = float(record[2])
+                trial_count = int(record[3])
 
-            timestamp_item = QTableWidgetItem(timestamp)
+            category, _, _ = self._classify_reaction(avg_rt)
+
+            # Format timestamp: strip microseconds for readability
+            ts_display = timestamp.replace("T", "  ").split(".")[0]
+
+            timestamp_item  = QTableWidgetItem(ts_display)
             participant_item = QTableWidgetItem(participant or "-")
-            reaction_item = QTableWidgetItem(f"{reaction:.1f}")
-            category_item = QTableWidgetItem(category)
-            reaction_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            avg_item        = QTableWidgetItem(f"{avg_rt:.1f}")
+            trials_item     = QTableWidgetItem(str(trial_count))
+            category_item   = QTableWidgetItem(category)
+            avg_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            trials_item.setTextAlignment(Qt.AlignCenter)
 
             self.history_table.setItem(row_idx, 0, timestamp_item)
             self.history_table.setItem(row_idx, 1, participant_item)
-            self.history_table.setItem(row_idx, 2, reaction_item)
-            self.history_table.setItem(row_idx, 3, category_item)
+            self.history_table.setItem(row_idx, 2, avg_item)
+            self.history_table.setItem(row_idx, 3, trials_item)
+            self.history_table.setItem(row_idx, 4, category_item)
 
-        self._update_history_summary(all_reactions)
+        # Stats panel / trend graph: filter to current participant when one is loaded
+        if self.current_participant:
+            participant_records = self.storage.get_participant_reaction_times(
+                self.current_participant
+            )
+            summary_reactions = [float(r[1]) for r in reversed(participant_records)]
+        else:
+            all_rows = self.storage.get_all_reaction_times()
+            summary_reactions = [
+                float(r["reaction_time"] if hasattr(r, "keys") else r[3])
+                for r in all_rows
+            ]
+
+        self._update_history_summary(summary_reactions)
 
     def _update_history_summary(self, reactions):
         self.total_trials_value.setText(str(len(reactions)))
@@ -1111,6 +1249,7 @@ class MainWindow(QMainWindow):
         can_start = (
             has_registered_name
             and has_serial_connection
+            and self._arduino_ready
             and not self.test_in_progress
             and not self.session_active
         )
@@ -1118,6 +1257,44 @@ class MainWindow(QMainWindow):
         self.stop_button.setEnabled(
             has_serial_connection and (self.session_active or self.test_in_progress)
         )
+
+        # Show a clear reason why START TEST is blocked
+        if can_start:
+            self.start_hint_label.setText("✅  Ready — press START TEST to begin")
+            self.start_hint_label.setStyleSheet("color: #1a7a3a; font-weight: 600;")
+        elif self.session_active or self.test_in_progress:
+            self.start_hint_label.setText("⏳  Session in progress")
+            self.start_hint_label.setStyleSheet("color: #b07000; font-weight: 600;")
+        elif not has_serial_connection:
+            self.start_hint_label.setText("⚠️  Connect to Arduino first (choose a port and click Connect)")
+            self.start_hint_label.setStyleSheet("color: #b05000; font-weight: 600;")
+        elif not self._arduino_ready:
+            self.start_hint_label.setText("⏳  Waiting for Arduino handshake (PING sent — please wait…)")
+            self.start_hint_label.setStyleSheet("color: #b07000; font-weight: 600;")
+        elif not has_registered_name:
+            self.start_hint_label.setText("⚠️  Register or load a participant first (use Register Participant or View Participants)")
+            self.start_hint_label.setStyleSheet("color: #b05000; font-weight: 600;")
+        else:
+            self.start_hint_label.setText("")
+
+    def keyPressEvent(self, event):
+        """Enter / Space / Return acts as the reaction button when GO is active."""
+        reaction_keys = {Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space}
+        if (
+            event.key() in reaction_keys
+            and self.test_in_progress
+            and self._go_received_at is not None
+            and not event.isAutoRepeat()
+        ):
+            rt_ms = (time.monotonic() - self._go_received_at) * 1000.0
+            self._go_received_at = None
+            # Tell Arduino the result so it can show RT on LCD and return to IDLE
+            if self.serial_handler and self.serial_handler.is_connected():
+                self.serial_handler.send_data(f"RESULT:{int(rt_ms)}\n")
+            # Process as a normal RT result in Python
+            self._handle_serial_message(f"RT:{rt_ms:.1f}")
+            return
+        super().keyPressEvent(event)
 
     def closeEvent(self, event):
         self.serial_poll_timer.stop()

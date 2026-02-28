@@ -12,6 +12,7 @@ class ReactionTimeStorage:
         self._ensure_participant_column()
         self._ensure_participants_table()
         self._ensure_profession_column()
+        self._ensure_session_id_column()
 
     def create_table(self):
         with self.connection:
@@ -57,22 +58,48 @@ class ReactionTimeStorage:
                     "ALTER TABLE participants ADD COLUMN profession TEXT"
                 )
 
+    def _ensure_session_id_column(self):
+        cursor = self.connection.cursor()
+        cursor.execute("PRAGMA table_info(reaction_times)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if 'session_id' not in columns:
+            with self.connection:
+                self.connection.execute(
+                    "ALTER TABLE reaction_times ADD COLUMN session_id TEXT"
+                )
+
     def _ensure_parent_directory(self):
         parent_dir = os.path.dirname(self.db_path)
         if parent_dir:
             os.makedirs(parent_dir, exist_ok=True)
 
-    def save_reaction_time(self, participant_name, reaction_time_ms):
+    def save_reaction_time(self, participant_name, reaction_time_ms, session_id=None):
         timestamp = datetime.now().isoformat()
         with self.connection:
             self.connection.execute('''
-                INSERT INTO reaction_times (timestamp, participant_name, reaction_time)
-                VALUES (?, ?, ?)
-            ''', (timestamp, participant_name, reaction_time_ms))
+                INSERT INTO reaction_times (timestamp, participant_name, reaction_time, session_id)
+                VALUES (?, ?, ?, ?)
+            ''', (timestamp, participant_name, reaction_time_ms, session_id))
 
     def get_all_reaction_times(self):
         cursor = self.connection.cursor()
         cursor.execute('SELECT * FROM reaction_times ORDER BY id DESC')
+        return cursor.fetchall()
+
+    def get_session_averages(self):
+        """Return one row per session: (timestamp, participant_name, avg_rt, trial_count).
+        Rows without a session_id (legacy data) are each treated as their own session."""
+        cursor = self.connection.cursor()
+        cursor.execute('''
+            SELECT
+                MIN(timestamp)             AS timestamp,
+                participant_name,
+                ROUND(AVG(reaction_time), 1) AS avg_rt,
+                COUNT(*)                   AS trial_count
+            FROM reaction_times
+            GROUP BY COALESCE(session_id, CAST(id AS TEXT))
+            ORDER BY MIN(id) DESC
+        ''')
         return cursor.fetchall()
 
     # ── Participant registry ──────────────────────────────────────────────────
