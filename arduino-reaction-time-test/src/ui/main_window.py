@@ -32,9 +32,11 @@ if __package__ in {None, ""}:
         sys.path.insert(0, str(project_root))
     from src.data.storage import ReactionTimeStorage
     from src.utils.serial_handler import SerialHandler
+    from src.ui.participants_window import ParticipantsWindow, RegisterParticipantDialog
 else:
     from ..data.storage import ReactionTimeStorage
     from ..utils.serial_handler import SerialHandler
+    from .participants_window import ParticipantsWindow, RegisterParticipantDialog
 
 try:
     from serial.tools import list_ports
@@ -204,6 +206,8 @@ class MainWindow(QMainWindow):
         self.serial_poll_timer.setInterval(50)
         _connect_signal(self.serial_poll_timer.timeout, self.poll_serial_data)
 
+        self._participants_window = None   # lazy-created
+
         self._build_ui()
         self.populate_serial_ports()
         self.refresh_history()
@@ -282,6 +286,11 @@ class MainWindow(QMainWindow):
         self.register_button.setObjectName("SecondaryButton")
         _connect_signal(self.register_button.clicked, self.register_participant)
         setup_layout.addWidget(self.register_button)
+
+        self.view_participants_btn = QPushButton("👥  View Participants")
+        self.view_participants_btn.setObjectName("SecondaryButton")
+        _connect_signal(self.view_participants_btn.clicked, self._open_participants_window)
+        setup_layout.addWidget(self.view_participants_btn)
 
         self.participant_status = QLabel()
         self.participant_status.setObjectName("InlineStatus")
@@ -676,19 +685,49 @@ class MainWindow(QMainWindow):
         self._sync_start_button_state()
 
     def register_participant(self):
-        participant_name = self.name_input.text().strip()
-        if not participant_name:
-            QMessageBox.warning(self, "Participant", "Please enter a participant name first.")
-            return
+        prefill = self.name_input.text().strip()
+        dlg = RegisterParticipantDialog(self.storage, prefill_name=prefill, parent=self)
+        dlg.registered.connect(self._on_participant_registered)
+        dlg.exec_()
 
-        self.current_participant = participant_name
-        self._set_participant_status(f"Registered: {participant_name}", "success")
+    def _on_participant_registered(self, name: str, age: int, gender: str) -> None:
+        self.name_input.setText(name)
+        self.current_participant = name
+        self._set_participant_status(f"Registered: {name} (Age {age}, {gender})", "success")
         self._set_feedback(
-            f"{participant_name} is ready. Connect Arduino and start the test.",
+            f"{name} is ready. Connect Arduino and start the test.",
             "success",
         )
         self._update_participant_chip()
         self._sync_start_button_state()
+
+    def _open_participants_window(self) -> None:
+        if self._participants_window is None:
+            self._participants_window = ParticipantsWindow(self.storage, parent=None)
+            self._participants_window.participant_selected.connect(self._load_participant_from_registry)
+        self._participants_window.refresh()
+        self._participants_window.show()
+        self._participants_window.raise_()
+        self._participants_window.activateWindow()
+
+    def _load_participant_from_registry(self, name: str) -> None:
+        """Called when the user double-clicks or presses Load in the participants window."""
+        participant = self.storage.get_participant(name)
+        age    = int(participant["age"])    if participant and participant["age"]    else 0
+        gender = participant["gender"]      if participant and participant["gender"] else "—"
+        self.name_input.setText(name)
+        self.current_participant = name
+        self._set_participant_status(
+            f"Loaded: {name} (Age {age}, {gender})", "success"
+        )
+        self._set_feedback(
+            f"{name} loaded from registry. Connect Arduino and start the test.",
+            "success",
+        )
+        self._update_participant_chip()
+        self._sync_start_button_state()
+        self.raise_()
+        self.activateWindow()
 
     def populate_serial_ports(self):
         current_selected = self.port_select.currentData()

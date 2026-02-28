@@ -10,6 +10,7 @@ class ReactionTimeStorage:
         self.connection.row_factory = sqlite3.Row
         self.create_table()
         self._ensure_participant_column()
+        self._ensure_participants_table()
 
     def create_table(self):
         with self.connection:
@@ -32,6 +33,18 @@ class ReactionTimeStorage:
                     "ALTER TABLE reaction_times ADD COLUMN participant_name TEXT"
                 )
 
+    def _ensure_participants_table(self):
+        with self.connection:
+            self.connection.execute('''
+                CREATE TABLE IF NOT EXISTS participants (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    age INTEGER,
+                    gender TEXT,
+                    registered_at TEXT NOT NULL
+                )
+            ''')
+
     def _ensure_parent_directory(self):
         parent_dir = os.path.dirname(self.db_path)
         if parent_dir:
@@ -49,6 +62,45 @@ class ReactionTimeStorage:
         cursor = self.connection.cursor()
         cursor.execute('SELECT * FROM reaction_times ORDER BY id DESC')
         return cursor.fetchall()
+
+    # ── Participant registry ──────────────────────────────────────────────────
+
+    def save_participant(self, name: str, age: int, gender: str) -> None:
+        """Insert or update a participant record."""
+        registered_at = datetime.now().isoformat()
+        with self.connection:
+            self.connection.execute('''
+                INSERT INTO participants (name, age, gender, registered_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    age = excluded.age,
+                    gender = excluded.gender,
+                    registered_at = excluded.registered_at
+            ''', (name, age, gender, registered_at))
+
+    def get_all_participants(self):
+        """Return all participants ordered by registration date (newest first)."""
+        cursor = self.connection.cursor()
+        cursor.execute('SELECT * FROM participants ORDER BY registered_at DESC')
+        return cursor.fetchall()
+
+    def get_participant(self, name: str):
+        """Return a single participant by name, or None."""
+        cursor = self.connection.cursor()
+        cursor.execute('SELECT * FROM participants WHERE name = ?', (name,))
+        return cursor.fetchone()
+
+    def get_participant_stats(self, name: str):
+        """Return (trial_count, avg_ms, best_ms) for a participant."""
+        cursor = self.connection.cursor()
+        cursor.execute('''
+            SELECT COUNT(*) as trials,
+                   AVG(reaction_time) as avg_rt,
+                   MIN(reaction_time) as best_rt
+            FROM reaction_times
+            WHERE participant_name = ?
+        ''', (name,))
+        return cursor.fetchone()
 
     def close(self):
         self.connection.close()
