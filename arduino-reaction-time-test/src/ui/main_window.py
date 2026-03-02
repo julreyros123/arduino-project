@@ -1132,6 +1132,10 @@ class MainWindow(QMainWindow):
                 self._set_feedback("Input received outside active GO phase.", "danger")
             return
 
+        # Clear the PC-side GO timestamp now that a result is being recorded.
+        # Leaving it set would allow a simultaneous keyboard press to re-enter
+        # this path with a near-zero time (the serial transit latency ~17 ms).
+        self._go_received_at = None
         participant_name = self.current_participant or self.name_input.text().strip() or "Unknown"
         self.storage.save_reaction_time(participant_name, reaction_time_ms, self._current_session_id)
         self.latest_reaction_ms = reaction_time_ms

@@ -36,6 +36,7 @@ TestState state       = IDLE;
 unsigned long stateStartMs    = 0;
 unsigned long reactionStartMs = 0;
 unsigned long randomDelayMs   = 0;
+unsigned long buzzerOffAt     = 0;   // non-blocking buzzer cutoff (0 = off)
 int  trialNumber = 0;          // increments on each "S", resets on "X"
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -69,6 +70,14 @@ const char* getCategory(unsigned long rt) {
 
 // ── Core actions ─────────────────────────────────────────────────────
 
+// Active-buzzer beep helper: drives pin HIGH for `durationMs`, then LOW.
+// Call multiple times for repeated beeps.
+void beepBuzzer(unsigned int durationMs) {
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(durationMs);
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
 // Arm a new trial: pick random delay, update LCD, notify Python.
 void armTrial() {
   randomDelayMs = random(MIN_DELAY_MS, MAX_DELAY_MS + 1);
@@ -86,20 +95,25 @@ void armTrial() {
   Serial.println(F("ARMED"));
 }
 
-// Fire the GO signal: LED on, buzzer on (stays on until press/timeout), update LCD, notify Python.
+// Fire the GO signal: LED on, start non-blocking buzzer, record start time, notify Python.
 void triggerGo() {
   state = WAITING_FOR_PRESS;
 
-  // Activate stimulus – buzzer stays ON until stopTest() turns it off.
-  digitalWrite(LED_PIN,    HIGH);
-  digitalWrite(BUZZER_PIN, HIGH);
+  digitalWrite(LED_PIN, HIGH);
 
-  lcdShow(">> GO! <<", "Press button now");
-
-  // Start the reaction clock AFTER the stimulus is fully visible/audible
-  // so the measured time reflects true user response latency.
+  // ── CRITICAL ORDERING ──────────────────────────────────────────────
+  // Set the reaction clock and send GO to the PC BEFORE anything else.
+  // Any code below this point (LCD, buzzer) must NOT use blocking delay(),
+  // otherwise both the Arduino timer and the PC-side timer (_go_received_at)
+  // would start late, causing artificially short reaction times.
   reactionStartMs = millis();
   Serial.println(F("GO"));
+
+  // Non-blocking audible cue: buzzerOffAt tells loop() when to silence it.
+  digitalWrite(BUZZER_PIN, HIGH);
+  buzzerOffAt = millis() + 80;   // 80 ms audible pulse, turned off in loop()
+
+  lcdShow(">> GO! <<", "Press button now");
 }
 
 // Reset to IDLE.  Pass resetSession=true to zero the trial counter.
@@ -108,6 +122,7 @@ void stopTest(bool resetSession = false) {
   stateStartMs    = 0;
   reactionStartMs = 0;
   randomDelayMs   = 0;
+  buzzerOffAt     = 0;   // cancel any pending non-blocking beep
   if (resetSession) trialNumber = 0;
 
   digitalWrite(LED_PIN,    LOW);
@@ -181,6 +196,11 @@ void handleCommand(const String& cmd) {
     } else {
       lcdShow("Session Done!", "No valid result");
     }
+    // Three short beeps to audibly signal session completion.
+    for (uint8_t i = 0; i < 3; i++) {
+      beepBuzzer(120);
+      delay(100);
+    }
   }
 }
 
@@ -200,6 +220,13 @@ void setup() {
   lcd.backlight();
   // Show waiting message — the test ONLY starts when Python sends "S".
   lcdShow("  RT Tester  ", " Waiting PC...");
+
+  // ── Active-buzzer initialisation: two short beeps confirm the buzzer
+  // is wired and driven correctly before any test begins.
+  beepBuzzer(100);
+  delay(100);
+  beepBuzzer(100);
+
   // Announce readiness to Python so it can confirm the handshake.
   Serial.println(F("HELLO"));
 
@@ -247,6 +274,12 @@ void loop() {
 
   // ── WAITING FOR PRESS ────────────────────────────────────────────
   if (state == WAITING_FOR_PRESS) {
+
+    // Non-blocking buzzer cutoff.
+    if (buzzerOffAt > 0 && millis() >= buzzerOffAt) {
+      digitalWrite(BUZZER_PIN, LOW);
+      buzzerOffAt = 0;
+    }
 
     // Valid reaction press
     if (buttonPressed()) {

@@ -1,6 +1,14 @@
 def calculate_reaction_time(start_time, end_time):
-    """Calculate the reaction time in seconds."""
-    return end_time - start_time
+    """Calculate the reaction time in milliseconds.
+
+    Args:
+        start_time: GO signal timestamp in seconds (e.g. time.monotonic()).
+        end_time:   Button/key press timestamp in seconds.
+
+    Returns:
+        Reaction time in milliseconds (float).
+    """
+    return (end_time - start_time) * 1000.0
 
 def average_reaction_time(reaction_times):
     """Calculate the average reaction time from a list of reaction times."""

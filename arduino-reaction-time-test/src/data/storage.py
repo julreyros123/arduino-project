@@ -1,5 +1,6 @@
 import os
 import sqlite3
+import uuid as _uuid
 from datetime import datetime
 
 class ReactionTimeStorage:
@@ -13,6 +14,7 @@ class ReactionTimeStorage:
         self._ensure_participants_table()
         self._ensure_profession_column()
         self._ensure_session_id_column()
+        self._ensure_participant_uuid_column()
 
     def create_table(self):
         with self.connection:
@@ -68,6 +70,27 @@ class ReactionTimeStorage:
                     "ALTER TABLE reaction_times ADD COLUMN session_id TEXT"
                 )
 
+    def _ensure_participant_uuid_column(self):
+        """Add participant_uuid to the participants table and backfill any NULL rows."""
+        cursor = self.connection.cursor()
+        cursor.execute("PRAGMA table_info(participants)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if 'participant_uuid' not in columns:
+            with self.connection:
+                self.connection.execute(
+                    "ALTER TABLE participants ADD COLUMN participant_uuid TEXT"
+                )
+        # Backfill rows that have no UUID (first run after migration).
+        cursor.execute("SELECT id FROM participants WHERE participant_uuid IS NULL")
+        rows = cursor.fetchall()
+        if rows:
+            with self.connection:
+                for row in rows:
+                    self.connection.execute(
+                        "UPDATE participants SET participant_uuid = ? WHERE id = ?",
+                        (str(_uuid.uuid4()), row[0]),
+                    )
+
     def _ensure_parent_directory(self):
         parent_dir = os.path.dirname(self.db_path)
         if parent_dir:
@@ -106,18 +129,25 @@ class ReactionTimeStorage:
 
     def save_participant(self, name: str, age: int, gender: str,
                          profession: str = "") -> None:
-        """Insert or update a participant record."""
+        """Insert or update a participant record, preserving their UUID on update."""
         registered_at = datetime.now().isoformat()
+        # Preserve the existing UUID when updating; assign a fresh one for new registrations.
+        existing = self.get_participant(name)
+        participant_uuid = (
+            existing["participant_uuid"]
+            if (existing and existing["participant_uuid"])
+            else str(_uuid.uuid4())
+        )
         with self.connection:
             self.connection.execute('''
-                INSERT INTO participants (name, age, gender, profession, registered_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO participants (name, age, gender, profession, registered_at, participant_uuid)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(name) DO UPDATE SET
-                    age = excluded.age,
-                    gender = excluded.gender,
-                    profession = excluded.profession,
+                    age           = excluded.age,
+                    gender        = excluded.gender,
+                    profession    = excluded.profession,
                     registered_at = excluded.registered_at
-            ''', (name, age, gender, profession or "", registered_at))
+            ''', (name, age, gender, profession or "", registered_at, participant_uuid))
 
     def get_all_participants(self):
         """Return all participants ordered by registration date (newest first)."""
@@ -126,9 +156,21 @@ class ReactionTimeStorage:
         return cursor.fetchall()
 
     def get_participant(self, name: str):
-        """Return a single participant by name, or None."""
+        """Return a single participant by exact name, or None."""
         cursor = self.connection.cursor()
         cursor.execute('SELECT * FROM participants WHERE name = ?', (name,))
+        return cursor.fetchone()
+
+    def get_participant_ci(self, name: str):
+        """Case-insensitive name lookup. Returns the first match or None."""
+        cursor = self.connection.cursor()
+        cursor.execute('SELECT * FROM participants WHERE LOWER(name) = LOWER(?)', (name,))
+        return cursor.fetchone()
+
+    def get_participant_by_uuid(self, participant_uuid: str):
+        """Return a single participant by their permanent UUID, or None."""
+        cursor = self.connection.cursor()
+        cursor.execute('SELECT * FROM participants WHERE participant_uuid = ?', (participant_uuid,))
         return cursor.fetchone()
 
     def get_participant_stats(self, name: str):

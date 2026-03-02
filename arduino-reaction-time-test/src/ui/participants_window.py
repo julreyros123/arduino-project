@@ -231,6 +231,16 @@ class ParticipantDetailDialog(QDialog):
             info_row.addWidget(card, stretch=1)
         body.addLayout(info_row)
 
+        # ── Participant UUID ──────────────────────────────────────────────────
+        if p and p["participant_uuid"]:
+            uid_label = QLabel(f"Participant ID:  {p['participant_uuid']}")
+            uid_label.setObjectName("MetricLabel")
+            uid_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            uid_label.setStyleSheet(
+                "color: #7a9ab8; font-size: 10px; font-family: monospace; padding: 2px 0;"
+            )
+            body.addWidget(uid_label)
+
         # ── Trend chart ──
         rt_values = [float(r["reaction_time"]) for r in rows]
         if rt_values:
@@ -303,6 +313,7 @@ class RegisterParticipantDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.storage = storage
+        self._prefill_name = prefill_name        # kept for duplicate-check logic
         self.setWindowTitle("Register Participant")
         self.setMinimumWidth(420)
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
@@ -439,6 +450,34 @@ class RegisterParticipantDialog(QDialog):
             QMessageBox.warning(self, "Required Field", "Please select a gender.")
             self.gender_combo.setFocus()
             return
+
+        # ── Duplicate / case-insensitive name guard ───────────────────────────
+        # Skip the check when the user is editing the participant they opened the
+        # dialog for (prefill_name matches what they typed, case-insensitively).
+        is_editing_self = bool(
+            self._prefill_name
+            and self._prefill_name.lower() == name.lower()
+        )
+        if not is_editing_self:
+            existing = self.storage.get_participant_ci(name)
+            if existing:
+                uid_hint = existing["participant_uuid"] or "—"
+                reply = QMessageBox.question(
+                    self,
+                    "Name Already Registered",
+                    f'A participant named \u201c{existing["name"]}\u201d is already registered.\n'
+                    f'Participant ID: {uid_hint}\n\n'
+                    "Do you want to update their details instead?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if reply != QMessageBox.Yes:
+                    self.name_input.setFocus()
+                    return
+                # Snap to the canonical casing already stored in the DB.
+                name = existing["name"]
+                self.name_input.setText(name)
+
         age = self.age_spin.value()
         gender = self.gender_combo.currentText()
         profession = self.profession_input.text().strip()
