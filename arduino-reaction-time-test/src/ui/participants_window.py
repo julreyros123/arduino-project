@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 from typing import Optional, Callable
 
-from PyQt5.QtCore import Qt, QPointF, QStringListModel, pyqtSignal
+from PyQt5.QtCore import Qt, QPointF, QRectF, QStringListModel, pyqtSignal
 from PyQt5.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
 from PyQt5.QtWidgets import (
     QAction,
@@ -70,13 +70,78 @@ def _category_color(category: str) -> str:
 # ── Mini trend chart ───────────────────────────────────────────────────────────
 
 class _MiniTrendWidget(QWidget):
-    """Lightweight painted line graph for the detail dialog."""
+    """
+    Painted line graph for the participant detail dialog.
+    Hovering within 20 px of any data point shows an inline tooltip with:
+      • Trial number  •  Reaction time  •  Category (colour-coded)
+    """
+
+    _SNAP_PX = 20
 
     def __init__(self, values: list[float], parent=None):
         super().__init__(parent)
         self._values = values
+        self._points: list = []
+        self._hovered_idx: Optional[int] = None
         self.setMinimumHeight(110)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setMouseTracking(True)
+
+    # ── Mouse events ───────────────────────────────────────────────────────────
+
+    def mouseMoveEvent(self, event):
+        if not self._points:
+            if self._hovered_idx is not None:
+                self._hovered_idx = None
+                self.update()
+            super().mouseMoveEvent(event)
+            return
+
+        mx, my = event.x(), event.y()
+        best_idx, best_dist = None, float("inf")
+        for i, pt in enumerate(self._points):
+            d = ((mx - pt.x()) ** 2 + (my - pt.y()) ** 2) ** 0.5
+            if d < best_dist:
+                best_dist, best_idx = d, i
+
+        new_idx = best_idx if best_dist <= self._SNAP_PX else None
+        if new_idx != self._hovered_idx:
+            self._hovered_idx = new_idx
+            self.update()
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event):
+        if self._hovered_idx is not None:
+            self._hovered_idx = None
+            self.update()
+        super().leaveEvent(event)
+
+    # ── Helpers ────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _classify(ms: float):
+        if ms < 200:
+            return "Excellent", QColor("#15803a")
+        if ms <= 300:
+            return "Normal", QColor("#1a5699")
+        if ms <= 380:
+            return "Slightly Slow", QColor("#b45309")
+        return "Delayed", QColor("#b91c1c")
+
+    def _build_points(self, rect):
+        mn     = min(self._values)
+        spread = max(max(self._values) - mn, 1.0)
+        n      = len(self._values)
+        step   = rect.width() / max(n - 1, 1)
+        return [
+            QPointF(
+                rect.left() + idx * step,
+                rect.bottom() - ((v - mn) / spread) * rect.height(),
+            )
+            for idx, v in enumerate(self._values)
+        ]
+
+    # ── Paint ──────────────────────────────────────────────────────────────────
 
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -86,6 +151,7 @@ class _MiniTrendWidget(QWidget):
         if len(self._values) < 2:
             painter.setPen(QPen(QColor("#8aa0ba"), 1))
             painter.drawText(self.rect(), Qt.AlignCenter, "Not enough data for trend")
+            self._points = []
             return
 
         rect = self.rect().adjusted(12, 10, -12, -10)
@@ -94,7 +160,10 @@ class _MiniTrendWidget(QWidget):
 
         mn = min(self._values)
         mx = max(self._values)
-        spread = max(mx - mn, 1.0)
+
+        # Cache points for hit-testing.
+        self._points = self._build_points(rect)
+        points = self._points
 
         # Grid lines
         painter.setPen(QPen(QColor("#d8e3f0"), 1))
@@ -103,26 +172,22 @@ class _MiniTrendWidget(QWidget):
             painter.drawLine(rect.left(), int(y), rect.right(), int(y))
 
         # Data line
-        n = len(self._values)
-        step = rect.width() / max(n - 1, 1)
-        points = []
-        for idx, v in enumerate(self._values):
-            x = rect.left() + idx * step
-            y = rect.bottom() - ((v - mn) / spread) * rect.height()
-            points.append(QPointF(x, y))
-
         path = QPainterPath(points[0])
         for p in points[1:]:
             path.lineTo(p)
-
         painter.setPen(QPen(QColor("#2a6ab0"), 2))
         painter.drawPath(path)
 
-        # Dots
-        painter.setBrush(QColor("#2a6ab0"))
-        painter.setPen(Qt.NoPen)
-        for p in points:
-            painter.drawEllipse(p, 3, 3)
+        # Dots — highlight the hovered one differently
+        for i, p in enumerate(points):
+            if i == self._hovered_idx:
+                painter.setPen(QPen(QColor("#1050a0"), 2))
+                painter.setBrush(QColor("#2a6ab0"))
+                painter.drawEllipse(p, 6, 6)
+            else:
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QColor("#2a6ab0"))
+                painter.drawEllipse(p, 3, 3)
 
         # Y-axis labels
         painter.setPen(QPen(QColor("#7a9ab8"), 1))
@@ -131,6 +196,71 @@ class _MiniTrendWidget(QWidget):
         painter.setFont(font)
         painter.drawText(rect.left(), rect.top() + 10, f"{mx:.0f}")
         painter.drawText(rect.left(), rect.bottom(), f"{mn:.0f}")
+
+        # ── Hover tooltip ─────────────────────────────────────────────────────
+        if self._hovered_idx is None:
+            return
+
+        idx      = self._hovered_idx
+        pt       = points[idx]
+        value    = self._values[idx]
+        category, cat_color = self._classify(value)
+
+        TW, TH, PAD = 124, 66, 8
+
+        tx = pt.x() + 14
+        if tx + TW > rect.right() + 12:
+            tx = pt.x() - TW - 14
+        ty = pt.y() - TH / 2
+        ty = max(float(rect.top()), min(ty, float(rect.bottom()) - TH))
+        box = QRectF(tx, ty, TW, TH)
+
+        # Drop shadow
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 28))
+        painter.drawRoundedRect(box.adjusted(2, 2, 2, 2), 7, 7)
+
+        # Background + border
+        painter.setPen(QPen(QColor("#bcd0e8"), 1))
+        painter.setBrush(QColor("#ffffff"))
+        painter.drawRoundedRect(box, 7, 7)
+
+        base_font = painter.font()
+
+        # Trial label
+        f = painter.font()
+        f.setPointSize(8)
+        f.setBold(True)
+        painter.setFont(f)
+        painter.setPen(QPen(QColor("#5a7a9a")))
+        painter.drawText(
+            QRectF(box.left() + PAD, box.top() + 7, TW - PAD * 2, 15),
+            Qt.AlignLeft | Qt.AlignVCenter,
+            f"Trial #{idx + 1}",
+        )
+
+        # RT value
+        f.setPointSize(13)
+        painter.setFont(f)
+        painter.setPen(QPen(QColor("#1a3a5a")))
+        painter.drawText(
+            QRectF(box.left() + PAD, box.top() + 22, TW - PAD * 2, 22),
+            Qt.AlignLeft | Qt.AlignVCenter,
+            f"{value:.1f} ms",
+        )
+
+        # Category
+        f.setPointSize(8)
+        f.setBold(False)
+        painter.setFont(f)
+        painter.setPen(QPen(cat_color))
+        painter.drawText(
+            QRectF(box.left() + PAD, box.top() + 45, TW - PAD * 2, 14),
+            Qt.AlignLeft | Qt.AlignVCenter,
+            category,
+        )
+
+        painter.setFont(base_font)
 
 
 # ── Participant Detail Dialog ──────────────────────────────────────────────────
@@ -294,13 +424,25 @@ class ParticipantDetailDialog(QDialog):
         body.addLayout(btn_row)
 
 
+import uuid as _uuid
+
 # ── Registration dialog ────────────────────────────────────────────────────────
 
 class RegisterParticipantDialog(QDialog):
     """
-    Modal dialog that collects name, age, and gender.
-    If `prefill_name` is given the name field is pre-populated (and locked).
-    Emits `registered(name, age, gender)` when confirmed.
+    Modal dialog that collects name, age, gender, and profession.
+    If `prefill_name` is given the name field is pre-populated.
+    Emits `registered(name, age, gender, profession)` when confirmed.
+
+    HCI design principles applied
+    ──────────────────────────────
+    • Live duplicate detection  — inline error appears as the user types,
+      before they ever press Register.
+    • Register button disabled  — while a validation error exists the button
+      is greyed out and cannot be clicked.
+    • Unique Participant ID      — shown as a read-only preview inside the form.
+    • Hard block in _on_accept  — catches any paste-then-submit bypass.
+    • Contextual button label   — shows "Edit" when editing self.
     """
 
     registered = pyqtSignal(str, int, str, str)  # name, age, gender, profession
@@ -313,21 +455,38 @@ class RegisterParticipantDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.storage = storage
-        self._prefill_name = prefill_name        # kept for duplicate-check logic
+        self._prefill_name = prefill_name   # original name when editing
+
+        # Determine UUID upfront:
+        #   • editing an existing participant → reuse their stored UUID
+        #   • new registration               → generate a fresh one now
+        _existing_on_open = self.storage.get_participant(prefill_name) if prefill_name else None
+        self._assigned_uuid: str = (
+            _existing_on_open["participant_uuid"]
+            if (_existing_on_open and _existing_on_open["participant_uuid"])
+            else str(_uuid.uuid4())
+        )
+
         self.setWindowTitle("Register Participant")
-        self.setMinimumWidth(420)
+        self.setMinimumWidth(460)
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
         self._build()
+
+        # Pre-fill fields when editing an existing participant.
         if prefill_name:
             self.name_input.setText(prefill_name)
-        # Always pre-fill existing data so editing is easy
-        existing = self.storage.get_participant(prefill_name) if prefill_name else None
-        if existing:
-            self.age_spin.setValue(int(existing["age"] or 0))
-            idx = self.gender_combo.findText(existing["gender"] or "")
+        if _existing_on_open:
+            self.age_spin.setValue(int(_existing_on_open["age"] or 0))
+            idx = self.gender_combo.findText(_existing_on_open["gender"] or "")
             if idx >= 0:
                 self.gender_combo.setCurrentIndex(idx)
-            self.profession_input.setText(existing["profession"] or "")
+            self.profession_input.setText(_existing_on_open["profession"] or "")
+
+        # Wire live validation AFTER fields are set to avoid spurious errors.
+        self.name_input.textChanged.connect(self._validate_name_live)
+        self._validate_name_live(self.name_input.text())
+
+    # ── UI construction ────────────────────────────────────────────────────────
 
     def _build(self) -> None:
         layout = QVBoxLayout()
@@ -341,7 +500,7 @@ class RegisterParticipantDialog(QDialog):
         layout.addWidget(header)
 
         sub = QLabel(
-            "Please enter the participant's details below.\n"
+            "Please enter the participant\u2019s details below.\n"
             "This information supports health monitoring and reaction-time analysis."
         )
         sub.setObjectName("DialogSubtext")
@@ -360,16 +519,15 @@ class RegisterParticipantDialog(QDialog):
         form_layout.setContentsMargins(0, 0, 0, 0)
         form_widget.setLayout(form_layout)
 
-        # Required marker helper
         def _req_label(text: str) -> QLabel:
             lbl = QLabel(f"{text}  <span style='color:#c0392b;'>*</span>")
             lbl.setTextFormat(Qt.RichText)
             return lbl
 
+        # ── Name field ──
         form_layout.addWidget(_req_label("Full Name"))
         self.name_input = QLineEdit()
         self.name_input.setPlaceholderText("e.g. Juan dela Cruz")
-        # Completer from existing participants
         _existing_names = [p["name"] for p in self.storage.get_all_participants()]
         _dlg_completer = QCompleter(_existing_names, self.name_input)
         _dlg_completer.setCaseSensitivity(Qt.CaseInsensitive)
@@ -378,6 +536,39 @@ class RegisterParticipantDialog(QDialog):
         self.name_input.setCompleter(_dlg_completer)
         form_layout.addWidget(self.name_input)
 
+        # Inline duplicate / required error — hidden until a problem is detected.
+        self._name_error_label = QLabel()
+        self._name_error_label.setWordWrap(True)
+        self._name_error_label.setTextFormat(Qt.RichText)
+        self._name_error_label.setStyleSheet(
+            "color: #b91c1c; font-size: 11px; padding: 4px 8px;"
+            "background: #fef2f2; border: 1px solid #fca5a5; border-radius: 4px;"
+        )
+        self._name_error_label.hide()
+        form_layout.addWidget(self._name_error_label)
+
+        # ── Participant ID (read-only preview) ──
+        id_row = QHBoxLayout()
+        id_row.setSpacing(8)
+        id_lbl = QLabel("Participant ID")
+        id_lbl.setObjectName("MetricLabel")
+        id_lbl.setFixedWidth(100)
+        self._id_display = QLineEdit(self._assigned_uuid)
+        self._id_display.setReadOnly(True)
+        self._id_display.setStyleSheet(
+            "color: #4a6a8a; background: #f1f5f9;"
+            "border: 1px solid #cbd5e1; border-radius: 4px;"
+            "font-family: monospace; font-size: 10px; padding: 2px 6px;"
+        )
+        self._id_display.setToolTip(
+            "Auto-generated unique identifier for this participant.\n"
+            "This ID is permanent and never changes, even if the name is updated."
+        )
+        id_row.addWidget(id_lbl)
+        id_row.addWidget(self._id_display)
+        form_layout.addLayout(id_row)
+
+        # ── Age / Gender row ──
         age_row = QHBoxLayout()
         age_row.setSpacing(12)
 
@@ -388,7 +579,6 @@ class RegisterParticipantDialog(QDialog):
         self.age_spin.setRange(1, 120)
         self.age_spin.setValue(20)
         self.age_spin.setSuffix(" yrs")
-        self.age_spin.setSpecialValueText("")  # no special text
         age_col.addWidget(self.age_spin)
         age_row.addLayout(age_col)
 
@@ -403,23 +593,21 @@ class RegisterParticipantDialog(QDialog):
 
         form_layout.addLayout(age_row)
 
-        # Profession (optional)
+        # ── Profession (optional) ──
         prof_label = QLabel("Profession  <span style='color:#7a9ab8; font-size:10px;'>(optional)</span>")
         prof_label.setTextFormat(Qt.RichText)
         form_layout.addWidget(prof_label)
         self.profession_input = QLineEdit()
-        self.profession_input.setPlaceholderText("e.g. Student, Engineer, Teacher…")
+        self.profession_input.setPlaceholderText("e.g. Student, Engineer, Teacher\u2026")
         form_layout.addWidget(self.profession_input)
 
         layout.addWidget(form_widget)
 
-        # Required note
         req_note = QLabel("<span style='color:#c0392b;'>*</span>  Required fields")
         req_note.setTextFormat(Qt.RichText)
         req_note.setObjectName("DialogSubtext")
         layout.addWidget(req_note)
 
-        # ── Context note ──
         note = QLabel(
             "\u24d8  Reaction time is a simple, accessible indicator of brain and motor health.\n"
             "      Early tracking helps detect cognitive changes before they become serious."
@@ -440,46 +628,104 @@ class RegisterParticipantDialog(QDialog):
         btn_box.rejected.connect(self.reject)
         layout.addWidget(btn_box)
 
+    # ── Live validation ────────────────────────────────────────────────────────
+
+    def _validate_name_live(self, text: str) -> None:
+        """
+        Called on every keystroke.  Shows/hides the inline error label and
+        enables/disables the Register button in real time.
+
+        Rules
+        ─────
+        • Blank input     → neutral (empty-check fires at submit time only).
+        • Editing self    → always allowed; show their existing UUID; label "Edit".
+        • New duplicate   → show inline error with conflicting ID; disable button.
+        • New unique name → clear error; show preview UUID; enable button.
+        """
+        name = text.strip()
+
+        if not name:
+            self._clear_name_error()
+            self._id_display.setText(self._assigned_uuid)
+            self.ok_btn.setText("Register")
+            self.ok_btn.setEnabled(True)
+            return
+
+        is_editing_self = bool(
+            self._prefill_name
+            and self._prefill_name.lower() == name.lower()
+        )
+        if is_editing_self:
+            self._clear_name_error()
+            self._id_display.setText(self._assigned_uuid)
+            self.ok_btn.setText("Edit")
+            self.ok_btn.setEnabled(True)
+            return
+
+        conflict = self.storage.get_participant_ci(name)
+        if conflict:
+            uid = conflict["participant_uuid"] or "\u2014"
+            canonical = conflict["name"]
+            self._show_name_error(
+                f"<b>\u26a0\ufe0f &nbsp;Duplicate name:</b> &nbsp;"
+                f"\u201c{canonical}\u201d is already registered.<br>"
+                f"<span style='font-family:monospace; font-size:10px;'>"
+                f"Participant ID: {uid}</span><br>"
+                "Choose a different name, or open <i>View Participants</i> "
+                "to load and edit the existing record."
+            )
+            self._id_display.setText(uid)   # show the conflicting participant's ID
+            self.ok_btn.setEnabled(False)
+            self.ok_btn.setText("Register")
+        else:
+            self._clear_name_error()
+            self._id_display.setText(self._assigned_uuid)
+            self.ok_btn.setText("Register")
+            self.ok_btn.setEnabled(True)
+
+    def _show_name_error(self, html: str) -> None:
+        self._name_error_label.setText(html)
+        self._name_error_label.show()
+        self.name_input.setStyleSheet("border: 1.5px solid #ef4444;")
+        self.adjustSize()
+
+    def _clear_name_error(self) -> None:
+        self._name_error_label.hide()
+        self._name_error_label.clear()
+        self.name_input.setStyleSheet("")
+
+    # ── Submit ─────────────────────────────────────────────────────────────────
+
     def _on_accept(self) -> None:
         name = self.name_input.text().strip()
+
+        # Required-field: name
         if not name:
-            QMessageBox.warning(self, "Required Field", "Please enter the participant's full name.")
+            self._show_name_error(
+                "<b>\u26a0\ufe0f &nbsp;Name is required.</b>"
+                " Please enter the participant\u2019s full name."
+            )
             self.name_input.setFocus()
             return
+
+        # Required-field: gender
         if self.gender_combo.currentIndex() == 0:
             QMessageBox.warning(self, "Required Field", "Please select a gender.")
             self.gender_combo.setFocus()
             return
 
-        # ── Duplicate / case-insensitive name guard ───────────────────────────
-        # Skip the check when the user is editing the participant they opened the
-        # dialog for (prefill_name matches what they typed, case-insensitively).
+        # Hard duplicate guard — catches paste-then-submit bypasses.
         is_editing_self = bool(
             self._prefill_name
             and self._prefill_name.lower() == name.lower()
         )
-        if not is_editing_self:
-            existing = self.storage.get_participant_ci(name)
-            if existing:
-                uid_hint = existing["participant_uuid"] or "—"
-                reply = QMessageBox.question(
-                    self,
-                    "Name Already Registered",
-                    f'A participant named \u201c{existing["name"]}\u201d is already registered.\n'
-                    f'Participant ID: {uid_hint}\n\n'
-                    "Do you want to update their details instead?",
-                    QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.No,
-                )
-                if reply != QMessageBox.Yes:
-                    self.name_input.setFocus()
-                    return
-                # Snap to the canonical casing already stored in the DB.
-                name = existing["name"]
-                self.name_input.setText(name)
+        if not is_editing_self and self.storage.get_participant_ci(name):
+            self._validate_name_live(name)   # re-show the inline error
+            self.name_input.setFocus()
+            return
 
-        age = self.age_spin.value()
-        gender = self.gender_combo.currentText()
+        age        = self.age_spin.value()
+        gender     = self.gender_combo.currentText()
         profession = self.profession_input.text().strip()
         self.storage.save_participant(name, age, gender, profession)
         self.registered.emit(name, age, gender, profession)
@@ -631,6 +877,13 @@ class ParticipantsWindow(QMainWindow):
         tip.setObjectName("DialogSubtext")
         bottom.addWidget(tip, stretch=1)
 
+        self.edit_btn = QPushButton("✏️  Edit Selected")
+        self.edit_btn.setObjectName("SecondaryButton")
+        self.edit_btn.setFixedHeight(34)
+        self.edit_btn.setToolTip("Open the registration form to edit the selected participant's details.")
+        self.edit_btn.clicked.connect(self._edit_selected)
+        bottom.addWidget(self.edit_btn)
+
         self.load_btn = QPushButton("Load Selected →")
         self.load_btn.setObjectName("PrimaryActionButton")
         self.load_btn.setFixedHeight(34)
@@ -717,6 +970,23 @@ class ParticipantsWindow(QMainWindow):
         dlg.registered.connect(lambda *_: self.refresh())
         dlg.exec_()
 
+    def _edit_selected(self) -> None:
+        rows = self.table.selectionModel().selectedRows()
+        if not rows:
+            QMessageBox.information(
+                self, "Edit Participant",
+                "Please select a participant from the list first."
+            )
+            return
+        name_item = self.table.item(rows[0].row(), 0)
+        if name_item:
+            self._open_edit_dialog(name_item.text())
+
+    def _open_edit_dialog(self, name: str) -> None:
+        dlg = RegisterParticipantDialog(self.storage, prefill_name=name, parent=self)
+        dlg.registered.connect(lambda *_: self.refresh())
+        dlg.exec_()
+
     def _show_context_menu(self, pos) -> None:
         index = self.table.indexAt(pos)
         if not index.isValid():
@@ -730,6 +1000,9 @@ class ParticipantsWindow(QMainWindow):
         view_action = QAction(f"📋  View Details — {name}", self)
         view_action.triggered.connect(lambda: self._open_detail_dialog(name))
         menu.addAction(view_action)
+        edit_action = QAction("✏️  Edit Details", self)
+        edit_action.triggered.connect(lambda: self._open_edit_dialog(name))
+        menu.addAction(edit_action)
         menu.addSeparator()
         load_action = QAction("▶  Load into Session", self)
         load_action.triggered.connect(lambda: self._select_and_load_by_name(name))

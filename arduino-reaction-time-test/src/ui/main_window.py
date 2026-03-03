@@ -57,62 +57,202 @@ def _connect_signal(signal, slot):
 
 
 class ReactionTrendWidget(QWidget):
+    """
+    Line chart for reaction-time trend.
+    Hovering over any data point shows an inline tooltip with:
+      • Trial number
+      • Reaction time in ms
+      • Performance category + colour
+    """
+
+    _SNAP_PX = 22   # max pixel distance to snap to a point
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._values = []
+        self._values: list = []
+        self._points: list = []        # cached QPointF list, rebuilt each paint
+        self._hovered_idx: Optional[int] = None
         self.setObjectName("TrendGraph")
         self.setMinimumHeight(140)
+        self.setMouseTracking(True)    # receive moves without a button held
+
+    # ── Public API ─────────────────────────────────────────────────────────────
 
     def set_values(self, values):
         self._values = list(values[-30:])
+        self._hovered_idx = None
         self.update()
+
+    # ── Mouse events ───────────────────────────────────────────────────────────
+
+    def mouseMoveEvent(self, event):
+        if not self._points:
+            if self._hovered_idx is not None:
+                self._hovered_idx = None
+                self.update()
+            super().mouseMoveEvent(event)
+            return
+
+        mx, my = event.x(), event.y()
+        best_idx, best_dist = None, float("inf")
+        for i, pt in enumerate(self._points):
+            d = ((mx - pt.x()) ** 2 + (my - pt.y()) ** 2) ** 0.5
+            if d < best_dist:
+                best_dist, best_idx = d, i
+
+        new_idx = best_idx if best_dist <= self._SNAP_PX else None
+        if new_idx != self._hovered_idx:
+            self._hovered_idx = new_idx
+            self.update()
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event):
+        if self._hovered_idx is not None:
+            self._hovered_idx = None
+            self.update()
+        super().leaveEvent(event)
+
+    # ── Helpers ────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _classify(ms: float):
+        if ms < 200:
+            return "Excellent", QColor("#15803a")
+        if ms <= 300:
+            return "Normal", QColor("#1a5699")
+        if ms <= 380:
+            return "Slightly Slow", QColor("#b45309")
+        return "Delayed", QColor("#b91c1c")
+
+    def _build_points(self, rect):
+        minimum = min(self._values)
+        spread  = max(max(self._values) - minimum, 1.0)
+        count   = len(self._values)
+        step_x  = rect.width() / max(count - 1, 1)
+        return [
+            QPointF(
+                rect.left() + idx * step_x,
+                rect.bottom() - ((v - minimum) / spread) * rect.height(),
+            )
+            for idx, v in enumerate(self._values)
+        ]
+
+    # ── Paint ──────────────────────────────────────────────────────────────────
 
     def paintEvent(self, event):
         super().paintEvent(event)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
+
         if len(self._values) < 2:
             painter.setPen(QPen(QColor("#8aa0ba"), 1))
             painter.drawText(self.rect(), Qt.AlignCenter, "Need more data for trend")
+            self._points = []
             return
 
         rect = self.rect().adjusted(14, 14, -14, -14)
         if rect.width() <= 0 or rect.height() <= 0:
             return
 
-        minimum = min(self._values)
-        maximum = max(self._values)
-        spread = max(maximum - minimum, 1.0)
+        # Cache points for hit-testing in mouseMoveEvent.
+        self._points = self._build_points(rect)
+        points = self._points
 
+        # Grid lines
         painter.setPen(QPen(QColor("#d8e3f0"), 1))
-        for line in range(1, 4):
-            y = rect.top() + (rect.height() * line / 4)
+        for i in range(1, 4):
+            y = rect.top() + rect.height() * i / 4
             painter.drawLine(rect.left(), int(y), rect.right(), int(y))
 
-        count = len(self._values)
-        step_x = rect.width() / max(count - 1, 1)
-        points = []
-        for idx, value in enumerate(self._values):
-            norm = (value - minimum) / spread
-            x = rect.left() + (idx * step_x)
-            y = rect.bottom() - (norm * rect.height())
-            points.append(QPointF(x, y))
-
+        # Data line
         path = QPainterPath(points[0])
-        for point in points[1:]:
-            path.lineTo(point)
+        for pt in points[1:]:
+            path.lineTo(pt)
         painter.setPen(QPen(QColor("#2f80ed"), 2))
         painter.drawPath(path)
 
-        fill_path = QPainterPath(path)
-        fill_path.lineTo(points[-1].x(), rect.bottom())
-        fill_path.lineTo(points[0].x(), rect.bottom())
-        fill_path.closeSubpath()
-        painter.fillPath(fill_path, QColor(47, 128, 237, 36))
+        # Fill under line
+        fill = QPainterPath(path)
+        fill.lineTo(points[-1].x(), rect.bottom())
+        fill.lineTo(points[0].x(),  rect.bottom())
+        fill.closeSubpath()
+        painter.fillPath(fill, QColor(47, 128, 237, 36))
 
+        # Last-point indicator
         painter.setPen(QPen(QColor("#1f67ce"), 1.6))
         painter.setBrush(QColor("#ffffff"))
         painter.drawEllipse(points[-1], 4, 4)
+
+        # ── Hover tooltip ─────────────────────────────────────────────────────
+        if self._hovered_idx is None:
+            return
+
+        idx   = self._hovered_idx
+        pt    = points[idx]
+        value = self._values[idx]
+        category, cat_color = self._classify(value)
+
+        # Highlighted dot
+        painter.setPen(QPen(QColor("#1050a0"), 2))
+        painter.setBrush(QColor("#2f80ed"))
+        painter.drawEllipse(pt, 6, 6)
+
+        # ── Tooltip box ───
+        TW, TH, PAD = 124, 66, 8
+
+        tx = pt.x() + 14
+        if tx + TW > rect.right() + 14:   # flip left when near right edge
+            tx = pt.x() - TW - 14
+        ty = pt.y() - TH / 2
+        ty = max(float(rect.top()), min(ty, float(rect.bottom()) - TH))
+        box = QRectF(tx, ty, TW, TH)
+
+        # Drop shadow
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 28))
+        painter.drawRoundedRect(box.adjusted(2, 2, 2, 2), 7, 7)
+
+        # Background + border
+        painter.setPen(QPen(QColor("#bcd0e8"), 1))
+        painter.setBrush(QColor("#ffffff"))
+        painter.drawRoundedRect(box, 7, 7)
+
+        base_font = painter.font()
+
+        # Trial label  (small, muted)
+        f = painter.font()
+        f.setPointSize(8)
+        f.setBold(True)
+        painter.setFont(f)
+        painter.setPen(QPen(QColor("#5a7a9a")))
+        painter.drawText(
+            QRectF(box.left() + PAD, box.top() + 7, TW - PAD * 2, 15),
+            Qt.AlignLeft | Qt.AlignVCenter,
+            f"Trial #{idx + 1}",
+        )
+
+        # RT value  (large, dark)
+        f.setPointSize(13)
+        painter.setFont(f)
+        painter.setPen(QPen(QColor("#1a3a5a")))
+        painter.drawText(
+            QRectF(box.left() + PAD, box.top() + 22, TW - PAD * 2, 22),
+            Qt.AlignLeft | Qt.AlignVCenter,
+            f"{value:.1f} ms",
+        )
+
+        # Category  (colour-coded)
+        f.setPointSize(8)
+        f.setBold(False)
+        painter.setFont(f)
+        painter.setPen(QPen(cat_color))
+        painter.drawText(
+            QRectF(box.left() + PAD, box.top() + 45, TW - PAD * 2, 14),
+            Qt.AlignLeft | Qt.AlignVCenter,
+            category,
+        )
+
+        painter.setFont(base_font)
 
 
 class SignalWidget(QWidget):
