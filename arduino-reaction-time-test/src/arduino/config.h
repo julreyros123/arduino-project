@@ -1,7 +1,7 @@
 // ===== PIN CONFIG =====
-#define BUTTON_PIN    3     // Reaction button (INPUT_PULLUP — LOW = pressed)
-#define LED_PIN       2     // GO indicator LED
-#define BUZZER_PIN    4     // Auditory GO signal
+#define BUTTON_PIN    2     // Reaction button (INPUT_PULLUP — LOW = pressed)
+#define LED_PIN       4     // GO indicator LED
+#define BUZZER_PIN    3     // Auditory GO signal
 
 // ===== LCD (I2C) =====
 // Address 0x27, 16 columns, 2 rows

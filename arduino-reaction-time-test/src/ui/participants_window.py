@@ -13,6 +13,7 @@ from PyQt5.QtCore import Qt, QPointF, QRectF, QStringListModel, pyqtSignal
 from PyQt5.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
 from PyQt5.QtWidgets import (
     QAction,
+    QApplication,
     QCheckBox,
     QCompleter,
     QComboBox,
@@ -771,6 +772,7 @@ class ParticipantsWindow(QMainWindow):
     def _build(self) -> None:
         central = QWidget()
         central.setObjectName("MainContainer")
+        central.setFocusPolicy(Qt.ClickFocus)   # clicking blank areas releases focus from search bar
         self.setCentralWidget(central)
 
         root = QVBoxLayout()
@@ -828,7 +830,12 @@ class ParticipantsWindow(QMainWindow):
 
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Search participant…")
-        self.search_input.textChanged.connect(self._on_search)
+        self.search_input.setToolTip(
+            "Type to filter participants.\n"
+            "Escape – release focus (enables Shift+V shortcut)\n"
+            "Ctrl+W – close this window"
+        )
+        self.search_input.textChanged.connect(lambda _: self._apply_filters())
         self._search_completer_model = QStringListModel()
         self._search_completer = QCompleter(self._search_completer_model, self.search_input)
         self._search_completer.setCaseSensitivity(Qt.CaseInsensitive)
@@ -838,6 +845,16 @@ class ParticipantsWindow(QMainWindow):
         self._search_completer.activated.connect(self._select_and_load_by_name)
         self.search_input.setCompleter(self._search_completer)
         toolbar.addWidget(self.search_input, stretch=1)
+
+        self.problematic_btn = QPushButton("⚠  Problematic Only")
+        self.problematic_btn.setObjectName("ProblematicFilterBtn")
+        self.problematic_btn.setCheckable(True)
+        self.problematic_btn.setToolTip(
+            "Show only participants whose average reaction time is\n"
+            "'Slightly Slow' (301–380 ms) or 'Delayed' (> 380 ms)."
+        )
+        self.problematic_btn.toggled.connect(lambda _: self._apply_filters())
+        toolbar.addWidget(self.problematic_btn)
 
         self.add_btn = QPushButton("➕  Add Participant")
         self.add_btn.setObjectName("PrimaryButton")
@@ -898,6 +915,27 @@ class ParticipantsWindow(QMainWindow):
 
         root.addLayout(bottom)
 
+    # ── Keyboard shortcuts ─────────────────────────────────────────────────────
+
+    def keyPressEvent(self, event) -> None:
+        """
+        Escape  – release focus from the search bar back to the window.
+        Ctrl+W  – close this window.
+        All other keys are passed through normally.
+        """
+        if event.key() == Qt.Key_Escape:
+            focused = QApplication.focusWidget()
+            if isinstance(focused, QLineEdit):
+                self.centralWidget().setFocus()
+            else:
+                # Escape with no text-field focused: also close, matching browser UX
+                self.close()
+            return
+        if event.key() == Qt.Key_W and event.modifiers() == Qt.ControlModifier:
+            self.close()
+            return
+        super().keyPressEvent(event)
+
     # ── Data ───────────────────────────────────────────────────────────────────
 
     def refresh(self) -> None:
@@ -920,6 +958,12 @@ class ParticipantsWindow(QMainWindow):
 
             values = [name, age, gender, reg, trials, avg_rt, best_rt, category]
             self.table.insertRow(row_idx)
+            # Subtle row background for problematic categories.
+            row_bg: Optional[QColor] = None
+            if category == "Slightly Slow":
+                row_bg = QColor("#fffbeb")   # very light amber
+            elif category == "Delayed":
+                row_bg = QColor("#fff1f2")   # very light red
             for col_idx, val in enumerate(values):
                 item = QTableWidgetItem(val)
                 item.setTextAlignment(Qt.AlignCenter if col_idx > 0 else Qt.AlignLeft | Qt.AlignVCenter)
@@ -935,26 +979,52 @@ class ParticipantsWindow(QMainWindow):
                         "Delayed":   QColor("#a81510"),
                     }
                     item.setForeground(color_map.get(category, QColor("#3a607d")))
+                if row_bg is not None:
+                    item.setBackground(row_bg)
                 self.table.setItem(row_idx, col_idx, item)
 
-        count = self.table.rowCount()
-        self.count_chip.setText(f"{count} participant{'s' if count != 1 else ''}")
         # Keep the search bar completer in sync with current participant names.
         names = [self.table.item(r, 0).text()
                  for r in range(self.table.rowCount())
                  if self.table.item(r, 0)]
         self._search_completer_model.setStringList(names)
+        # Re-apply active filters (search text + problematic toggle) and update count chip.
+        self._apply_filters()
 
-    def _on_search(self, text: str) -> None:
-        text = text.strip().lower()
+    _PROBLEMATIC_CATEGORIES: frozenset = frozenset({"Slightly Slow", "Delayed"})
+
+    def _apply_filters(self) -> None:
+        """Apply search-text and problematic-only filters together."""
+        text             = self.search_input.text().strip().lower()
+        problematic_only = self.problematic_btn.isChecked()
+        cat_col          = len(self.COLS) - 1   # "Category" is the last column
+
+        visible = 0
         for row in range(self.table.rowCount()):
-            item = self.table.item(row, 0)
-            name = item.text().lower() if item else ""
-            self.table.setRowHidden(row, bool(text and text not in name))
+            name_item = self.table.item(row, 0)
+            cat_item  = self.table.item(row, cat_col)
+            name      = name_item.text().lower() if name_item else ""
+            category  = cat_item.text()          if cat_item  else ""
+
+            hide = (text and text not in name) or \
+                   (problematic_only and category not in self._PROBLEMATIC_CATEGORIES)
+            self.table.setRowHidden(row, hide)
+            if not hide:
+                visible += 1
+
+        total = self.table.rowCount()
+        if problematic_only:
+            self.count_chip.setText(
+                f"{visible} problematic / {total} participant{'s' if total != 1 else ''}"
+            )
+        else:
+            self.count_chip.setText(
+                f"{total} participant{'s' if total != 1 else ''}"
+            )
 
     def _select_and_load_by_name(self, name: str) -> None:
         """Select the row matching `name` and immediately load the participant."""
-        # Un-hide all rows first so the target row is reachable.
+        # Un-hide all rows first so the target row is always reachable.
         for row in range(self.table.rowCount()):
             self.table.setRowHidden(row, False)
         # Find and select the row.

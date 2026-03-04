@@ -7,6 +7,7 @@ class SerialHandler:
         self.serial_connection = None
         self._recv_buf = b""
         self.last_error: str = ""
+        self.on_error = None   # optional callable(str) set by the UI for error callbacks
 
     def connect(self):
         self.last_error = ""
@@ -32,8 +33,24 @@ class SerialHandler:
         if self.serial_connection and self.serial_connection.is_open:
             try:
                 self.serial_connection.write(data.encode("ascii", errors="replace"))
-            except serial.SerialException as e:
-                print(f"Serial write error: {e}")
+            except (serial.SerialException, PermissionError, OSError) as e:
+                self.last_error = str(e)
+                # Force-close so is_connected() returns False immediately.
+                try:
+                    self.serial_connection.close()
+                except Exception:
+                    pass
+                self.serial_connection = None
+                self._recv_buf = b""
+                msg = (
+                    f"Serial write failed — COM port access denied.\n"
+                    f"Close the Arduino IDE Serial Monitor (or any other program\n"
+                    f"using this COM port) then reconnect.\n\nDetail: {e}"
+                )
+                if callable(self.on_error):
+                    self.on_error(msg)
+                else:
+                    print(f"Serial write error: {e}")
 
     def receive_data(self):
         if not (self.serial_connection and self.serial_connection.is_open):

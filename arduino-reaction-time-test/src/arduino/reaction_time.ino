@@ -8,9 +8,9 @@
 #include <LiquidCrystal_I2C.h>
 
 // ===== PIN CONFIG =====
-#define BUTTON_PIN    3     // Reaction button (INPUT_PULLUP — LOW = pressed)
-#define LED_PIN       2     // GO indicator LED
-#define BUZZER_PIN    4     // Auditory GO signal
+#define BUTTON_PIN    2     // Reaction button (NC, INPUT_PULLUP — LOW = rest, HIGH = pressed)
+#define LED_PIN       4     // GO indicator LED
+#define BUZZER_PIN    3     // Auditory GO signal
 
 // ===== LCD (I2C) =====
 #define LCD_ADDR      0x27
@@ -22,7 +22,8 @@ const int           NUM_TESTS        = 5;
 const unsigned long TIMEOUT_MS       = 5000;   // Max wait for reaction (ms)
 const unsigned long MIN_DELAY_MS     = 1000;   // Min random pre-GO delay (ms)
 const unsigned long MAX_DELAY_MS     = 3000;   // Max random pre-GO delay (ms)
-// Buzzer stays ON throughout WAITING_FOR_PRESS; stopTest() turns it off.
+const unsigned long BUZZ_DURATION_MS = 120;    // Buzzer ON duration on GO (ms)
+const unsigned long ARM_GRACE_MS     = 300;    // Ignore button presses for this long after arming
 
 // ===== SERIAL =====
 #define SERIAL_BAUD_RATE 9600
@@ -31,13 +32,16 @@ const unsigned long MAX_DELAY_MS     = 3000;   // Max random pre-GO delay (ms)
 LiquidCrystal_I2C lcd(LCD_ADDR, LCD_COLS, LCD_ROWS);
 
 // ── State machine ────────────────────────────────────────────────────
-enum TestState { IDLE, WAITING_RANDOM_DELAY, WAITING_FOR_PRESS };
+enum TestState { IDLE, WAITING_RANDOM_DELAY, WAITING_FOR_PRESS, BUTTON_TEST };
 TestState state       = IDLE;
 unsigned long stateStartMs    = 0;
 unsigned long reactionStartMs = 0;
 unsigned long randomDelayMs   = 0;
 unsigned long buzzerOffAt     = 0;   // non-blocking buzzer cutoff (0 = off)
-int  trialNumber = 0;          // increments on each "S", resets on "X"
+unsigned long armTimeMs       = 0;   // when the current trial was armed (grace-period ref)
+bool prevButtonState = LOW;          // LOW = resting state for NC button; used for edge detection
+int  trialNumber  = 0;         // increments on each "S", resets on "X"
+int  btnTestCount = 0;         // press counter used in BUTTON_TEST mode
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -48,12 +52,23 @@ void lcdShow(const char* line0, const char* line1 = "") {
   lcd.setCursor(0, 1);  lcd.print(line1);
 }
 
-// Debounced button read — waits for release before returning true.
+// Edge-detecting button read — returns true ONLY on a LOW→HIGH transition.
+// NC button: pin sits LOW at rest (closed to GND). Pressing opens the circuit;
+// INPUT_PULLUP pulls pin HIGH. So a press = rising edge.
 bool buttonPressed() {
-  if (digitalRead(BUTTON_PIN) == LOW) {
-    delay(20);                                          // debounce
-    if (digitalRead(BUTTON_PIN) == LOW) {
-      while (digitalRead(BUTTON_PIN) == LOW) delay(1); // wait release
+  bool isHigh = (digitalRead(BUTTON_PIN) == HIGH);
+  if (!isHigh) {
+    prevButtonState = LOW;                              // pin at rest — arm for next press
+    return false;
+  }
+  if (prevButtonState == HIGH) return false;            // still held from last press — ignore
+
+  // Rising edge detected — apply debounce
+  delay(15);
+  if (digitalRead(BUTTON_PIN) == HIGH) {
+    delay(5);
+    if (digitalRead(BUTTON_PIN) == HIGH) {
+      prevButtonState = HIGH;                           // latch until pin returns LOW
       return true;
     }
   }
@@ -82,7 +97,9 @@ void beepBuzzer(unsigned int durationMs) {
 void armTrial() {
   randomDelayMs = random(MIN_DELAY_MS, MAX_DELAY_MS + 1);
   stateStartMs  = millis();
+  armTimeMs     = millis();
   reactionStartMs = 0;
+  prevButtonState = digitalRead(BUTTON_PIN); // sync — if pin is already LOW, require a release first
   state = WAITING_RANDOM_DELAY;
 
   digitalWrite(LED_PIN,    LOW);
@@ -107,11 +124,12 @@ void triggerGo() {
   // otherwise both the Arduino timer and the PC-side timer (_go_received_at)
   // would start late, causing artificially short reaction times.
   reactionStartMs = millis();
+  prevButtonState = digitalRead(BUTTON_PIN); // sync before reaction window — wire already low won't count
   Serial.println(F("GO"));
 
   // Non-blocking audible cue: buzzerOffAt tells loop() when to silence it.
   digitalWrite(BUZZER_PIN, HIGH);
-  buzzerOffAt = millis() + 80;   // 80 ms audible pulse, turned off in loop()
+  buzzerOffAt = millis() + BUZZ_DURATION_MS;
 
   lcdShow(">> GO! <<", "Press button now");
 }
@@ -123,6 +141,7 @@ void stopTest(bool resetSession = false) {
   reactionStartMs = 0;
   randomDelayMs   = 0;
   buzzerOffAt     = 0;   // cancel any pending non-blocking beep
+  prevButtonState = digitalRead(BUTTON_PIN); // sync to actual pin level — avoids phantom edge if wire is still low
   if (resetSession) trialNumber = 0;
 
   digitalWrite(LED_PIN,    LOW);
@@ -165,23 +184,28 @@ void handleCommand(const String& cmd) {
     return;
   }
 
-  // "X" — abort / cancel the current session
-  if (cmd == "X") {
-    stopTest(true);   // reset trial counter too
-    lcdShow("  RT Tester  ", " Waiting PC...");
-    Serial.println(F("CANCELLED"));
+  // "BTNTEST" — enter button-test mode: every press is reported over serial
+  // and shown on the LCD.  Send "X" to exit.
+  if (cmd == "BTNTEST") {
+    state = BUTTON_TEST;
+    btnTestCount = 0;
+    lcdShow("Button Test", "Press button...");
+    Serial.println(F("BTNTEST:START"));
     return;
   }
 
-  // "RESULT:rt" — PC keyboard captured the reaction; show result on LCD
-  // and return to IDLE (mirrors what the hardware button path does).
-  if (cmd.startsWith("RESULT:")) {
-    unsigned long rt = cmd.substring(7).toInt();
-    digitalWrite(LED_PIN, LOW);
-    char rtLine[17];
-    snprintf(rtLine, sizeof(rtLine), "RT: %lu ms", rt);
-    lcdShow(rtLine, getCategory(rt));
-    stopTest();   // back to IDLE; trialNumber kept
+  // "X" — abort / cancel the current session
+  if (cmd == "X") {
+    if (state == BUTTON_TEST) {
+      state = IDLE;
+      btnTestCount = 0;
+      lcdShow("  RT Tester  ", " Waiting PC...");
+      Serial.println(F("BTNTEST:STOP"));
+      return;
+    }
+    stopTest(true);   // reset trial counter too
+    lcdShow("  RT Tester  ", " Waiting PC...");
+    Serial.println(F("CANCELLED"));
     return;
   }
 
@@ -249,11 +273,26 @@ void loop() {
   // ── IDLE ── nothing to do
   if (state == IDLE) return;
 
+  // ── BUTTON TEST ──────────────────────────────────────────────────
+  if (state == BUTTON_TEST) {
+    if (buttonPressed()) {
+      btnTestCount++;
+      char buf[17];
+      snprintf(buf, sizeof(buf), "Press #%d OK!", btnTestCount);
+      lcdShow(buf, "Send X to exit");
+      Serial.print(F("BTN:PRESS "));
+      Serial.println(btnTestCount);
+      beepBuzzer(40);   // short click feedback
+    }
+    return;
+  }
+
   // ── WAITING FOR RANDOM DELAY ─────────────────────────────────────
   if (state == WAITING_RANDOM_DELAY) {
 
-    // False-start: button pressed before GO
-    if (buttonPressed()) {
+    // False-start: button pressed before GO.
+    // ARM_GRACE_MS guard ignores residual contact / noise right after arming.
+    if (millis() - armTimeMs >= ARM_GRACE_MS && buttonPressed()) {
       char buf[17];
       snprintf(buf, sizeof(buf), "Trial %d/%d", trialNumber, NUM_TESTS);
       lcdShow("FALSE START!", "Wait for GO...");
@@ -281,21 +320,17 @@ void loop() {
       buzzerOffAt = 0;
     }
 
-    // Valid reaction press
+    // Detect press using the same edge-detecting buttonPressed() that works in BTNTEST.
     if (buttonPressed()) {
       unsigned long rt = millis() - reactionStartMs;
       digitalWrite(LED_PIN, LOW);
 
-      // LCD: show result
       char rtLine[17];
       snprintf(rtLine, sizeof(rtLine), "RT: %lu ms", rt);
       lcdShow(rtLine, getCategory(rt));
-
-      // Serial: notify Python
       Serial.print(F("RT:"));
       Serial.println(rt);
-
-      stopTest();   // back to IDLE; trialNumber kept for session tracking
+      stopTest();
       return;
     }
 

@@ -4,10 +4,11 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from PyQt5.QtCore import QPointF, QRectF, QSize, QStringListModel, Qt, QTimer
+from PyQt5.QtCore import QEvent, QPointF, QRectF, QSize, QStringListModel, Qt, QTimer
 from PyQt5.QtGui import QColor, QPainter, QPainterPath, QPen
 from PyQt5.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCompleter,
     QComboBox,
     QFrame,
@@ -366,6 +367,10 @@ class MainWindow(QMainWindow):
         self.refresh_history()
         self._refresh_name_completer()
 
+        # Install an app-level filter so reaction keys are captured regardless
+        # of which child widget currently holds keyboard focus.
+        QApplication.instance().installEventFilter(self)
+
     def _build_ui(self):
         self.setWindowTitle("Arduino Reaction-Time Tester")
         self.setMinimumSize(900, 600)
@@ -373,6 +378,7 @@ class MainWindow(QMainWindow):
 
         central_widget = QWidget(self)
         central_widget.setObjectName("MainContainer")
+        central_widget.setFocusPolicy(Qt.ClickFocus)   # clicking blank areas steals focus from inputs
         self.setCentralWidget(central_widget)
 
         root_layout = QVBoxLayout()
@@ -432,25 +438,33 @@ class MainWindow(QMainWindow):
         setup_layout.addWidget(QLabel("Participant Name"))
         self.name_input = QLineEdit()
         self.name_input.setPlaceholderText("Enter participant name")
+        self.name_input.setToolTip(
+            "Type a name to search or register.\n"
+            "Press Escape to release focus  |  Shift+Enter: Register  |  Shift+V: View Participants"
+        )
         _connect_signal(self.name_input.textChanged, self._on_name_changed)
-        _connect_signal(self.name_input.returnPressed, self.register_participant)
+        _connect_signal(self.name_input.returnPressed,
+                        lambda: QTimer.singleShot(0, self.register_participant))
         self._name_completer_model = QStringListModel()
         self._name_completer = QCompleter(self._name_completer_model, self.name_input)
         self._name_completer.setCaseSensitivity(Qt.CaseInsensitive)
         self._name_completer.setFilterMode(Qt.MatchContains)
         self._name_completer.setCompletionMode(QCompleter.PopupCompletion)
         # Selecting a suggestion loads the participant directly — no re-registration needed.
-        self._name_completer.activated.connect(self._load_participant_from_registry)
+        self._name_completer.activated.connect(self._load_participant_from_completer)
         self.name_input.setCompleter(self._name_completer)
+        self._completer_just_activated = False
         setup_layout.addWidget(self.name_input)
 
         self.register_button = QPushButton("Register Participant")
         self.register_button.setObjectName("SecondaryButton")
+        self.register_button.setToolTip("Open the registration form  (Shift+Enter)")
         _connect_signal(self.register_button.clicked, self.register_participant)
         setup_layout.addWidget(self.register_button)
 
         self.view_participants_btn = QPushButton("👥  View Participants")
         self.view_participants_btn.setObjectName("SecondaryButton")
+        self.view_participants_btn.setToolTip("Open the Participant Registry  (Shift+V)")
         _connect_signal(self.view_participants_btn.clicked, self._open_participants_window)
         setup_layout.addWidget(self.view_participants_btn)
 
@@ -860,6 +874,11 @@ class MainWindow(QMainWindow):
         self._sync_start_button_state()
 
     def register_participant(self):
+        # If the call originated from the name completer's Enter-key selection,
+        # the participant is already being loaded — skip opening the dialog.
+        if self._completer_just_activated:
+            self._completer_just_activated = False
+            return
         # Always open the dialog — pre-fills existing data if the participant
         # is already registered so the user can review or update their details.
         prefill = self.name_input.text().strip()
@@ -882,6 +901,7 @@ class MainWindow(QMainWindow):
         self._update_participant_chip()
         self._sync_start_button_state()
         self._refresh_name_completer()
+        self.refresh_history()
 
     def _open_participants_window(self) -> None:
         if self._participants_window is None:
@@ -893,7 +913,8 @@ class MainWindow(QMainWindow):
         self._participants_window.activateWindow()
 
     def _load_participant_from_registry(self, name: str) -> None:
-        """Called when the user double-clicks or presses Load in the participants window."""
+        """Called when the user double-clicks, presses Load in the participants window,
+        or selects a name from the completer popup."""
         participant = self.storage.get_participant(name)
         age        = int(participant["age"])    if participant and participant["age"]    else 0
         gender     = participant["gender"]      if participant and participant["gender"] else "—"
@@ -911,8 +932,16 @@ class MainWindow(QMainWindow):
         self._update_participant_chip()
         self._sync_start_button_state()
         self._refresh_name_completer()
+        self.refresh_history()
         self.raise_()
         self.activateWindow()
+
+    def _load_participant_from_completer(self, name: str) -> None:
+        """Slot for the name completer's activated signal.
+        Sets a flag so the subsequent returnPressed signal does not open
+        the registration dialog on top of the load that just happened."""
+        self._completer_just_activated = True
+        self._load_participant_from_registry(name)
 
     def populate_serial_ports(self):
         current_selected = self.port_select.currentData()
@@ -980,6 +1009,7 @@ class MainWindow(QMainWindow):
         handler = SerialHandler(selected_port, baudrate=ARDUINO_BAUD_RATE)
         handler.connect()
         if handler.is_connected():
+            handler.on_error = self._on_serial_write_error
             self.serial_handler = handler
             self.connect_button.setText("Disconnect")
             self.serial_poll_timer.start()
@@ -1010,6 +1040,38 @@ class MainWindow(QMainWindow):
                     "the USB cable is plugged in, and the correct port is selected."
                 )
             QMessageBox.critical(self, "Serial — Port Unavailable", detail)
+
+    def _on_serial_write_error(self, message: str):
+        """Called by SerialHandler when a write fails (e.g. COM port access denied)."""
+        # Reset connection state so the UI reflects the lost connection.
+        self.serial_handler = None
+        self.serial_poll_timer.stop()
+        self._ping_retry_timer.stop()
+        self._arduino_ready = False
+        self.session_active = False
+        self.test_in_progress = False
+        self.current_trial = 0
+        self.session_results = []
+        self._go_received_at = None
+        self.connect_button.setText("Connect")
+        self._set_connection_status("Status: Not connected", "warning")
+        self._set_signal_state("idle", "WAITING", "Reconnect Arduino to continue.")
+        self._update_trial_status()
+        self._update_connection_chip()
+        self._update_session_chip()
+        self._sync_start_button_state()
+        # Surface the error prominently.
+        self._set_feedback(
+            "Serial port lost: COM port access denied.\n"
+            "Close the Arduino IDE Serial Monitor (or any other program using this port),"
+            " then reconnect.",
+            "danger",
+        )
+        QMessageBox.critical(
+            self,
+            "Serial Port — Access Denied",
+            message,
+        )
 
     def _send_initial_ping(self):
         """Send the first PING after the stabilisation delay."""
@@ -1211,10 +1273,9 @@ class MainWindow(QMainWindow):
             return
         if value == "GO":
             self._go_received_at = time.monotonic()   # start PC-side reaction clock
-            self._set_signal_state("go", "GO", "Press the hardware button — or Enter / Space key.")
+            self._set_signal_state("go", "GO", "Press the hardware button!")
             self._set_feedback(
-                f"Trial {self.current_trial}/{SESSION_TRIALS}: GO! "
-                "Press the Arduino button  OR  hit Enter / Space on the keyboard.",
+                f"Trial {self.current_trial}/{SESSION_TRIALS}: GO! Press the Arduino button.",
                 "warning",
             )
             return
@@ -1343,18 +1404,15 @@ class MainWindow(QMainWindow):
             self.history_table.setItem(row_idx, 3, trials_item)
             self.history_table.setItem(row_idx, 4, category_item)
 
-        # Stats panel / trend graph: filter to current participant when one is loaded
+        # Stats panel / trend graph: only show data for the current participant.
+        # If none is loaded yet, clear the trend rather than mixing all participants.
         if self.current_participant:
             participant_records = self.storage.get_participant_reaction_times(
                 self.current_participant
             )
             summary_reactions = [float(r[1]) for r in reversed(participant_records)]
         else:
-            all_rows = self.storage.get_all_reaction_times()
-            summary_reactions = [
-                float(r["reaction_time"] if hasattr(r, "keys") else r[3])
-                for r in all_rows
-            ]
+            summary_reactions = []
 
         self._update_history_summary(summary_reactions)
 
@@ -1421,23 +1479,41 @@ class MainWindow(QMainWindow):
         else:
             self.start_hint_label.setText("")
 
+    def eventFilter(self, obj, event):
+        """App-level filter: keyboard shortcuts + hardware reaction input guard.
+
+        Shift+Return  → open Register Participant dialog  (works from anywhere)
+        Shift+V       → open View Participants window     (suppressed while a
+                        text-entry widget has focus so normal typing is preserved)
+        Escape        → release focus from the name field back to the window
+        """
+        if event.type() == QEvent.KeyPress:
+            modifiers = event.modifiers()
+            key       = event.key()
+
+            # Escape: clear focus from name input so Shift+V becomes available again
+            if key == Qt.Key_Escape:
+                focused = QApplication.focusWidget()
+                if isinstance(focused, QLineEdit):
+                    self.centralWidget().setFocus()
+                    return True
+
+            # Shift+Return → Register Participant
+            if key in (Qt.Key_Return, Qt.Key_Enter) and modifiers == Qt.ShiftModifier:
+                self.register_participant()
+                return True
+
+            # Shift+V → View Participants  (only when not typing in a text field)
+            if key == Qt.Key_V and modifiers == Qt.ShiftModifier:
+                focused = QApplication.focusWidget()
+                if not isinstance(focused, (QLineEdit, )):
+                    self._open_participants_window()
+                    return True
+
+        return super().eventFilter(obj, event)
+
     def keyPressEvent(self, event):
-        """Enter / Space / Return acts as the reaction button when GO is active."""
-        reaction_keys = {Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space}
-        if (
-            event.key() in reaction_keys
-            and self.test_in_progress
-            and self._go_received_at is not None
-            and not event.isAutoRepeat()
-        ):
-            rt_ms = (time.monotonic() - self._go_received_at) * 1000.0
-            self._go_received_at = None
-            # Tell Arduino the result so it can show RT on LCD and return to IDLE
-            if self.serial_handler and self.serial_handler.is_connected():
-                self.serial_handler.send_data(f"RESULT:{int(rt_ms)}\n")
-            # Process as a normal RT result in Python
-            self._handle_serial_message(f"RT:{rt_ms:.1f}")
-            return
+        """Fallback key handler for non-reaction keys."""
         super().keyPressEvent(event)
 
     def closeEvent(self, event):
