@@ -427,6 +427,29 @@ class ParticipantDetailDialog(QDialog):
 
 import uuid as _uuid
 
+
+def _parse_stored_name(stored_name: str):
+    """Split a stored 'LastName, FirstName [MI.]' back into (last, first, mi).
+    Falls back gracefully for legacy plain-name entries."""
+    if ", " in stored_name:
+        last, rest = stored_name.split(", ", 1)
+        parts = rest.split()
+        # Treat the final token as a middle initial if it is 1–2 chars
+        # (e.g. "S" or "S.").
+        if len(parts) >= 2 and len(parts[-1].rstrip(".")) == 1:
+            mi    = parts[-1].rstrip(".")
+            first = " ".join(parts[:-1])
+        else:
+            mi    = ""
+            first = rest
+        return last, first, mi
+    # Legacy plain name: heuristically treat last word as surname.
+    parts = stored_name.split()
+    if len(parts) >= 2:
+        return parts[-1], " ".join(parts[:-1]), ""
+    return stored_name, "", ""
+
+
 # ── Registration dialog ────────────────────────────────────────────────────────
 
 class RegisterParticipantDialog(QDialog):
@@ -475,7 +498,10 @@ class RegisterParticipantDialog(QDialog):
 
         # Pre-fill fields when editing an existing participant.
         if prefill_name:
-            self.name_input.setText(prefill_name)
+            last, first, mi = _parse_stored_name(prefill_name)
+            self.last_name_input.setText(last)
+            self.first_name_input.setText(first)
+            self.middle_initial_input.setText(mi)
         if _existing_on_open:
             self.age_spin.setValue(int(_existing_on_open["age"] or 0))
             idx = self.gender_combo.findText(_existing_on_open["gender"] or "")
@@ -484,8 +510,10 @@ class RegisterParticipantDialog(QDialog):
             self.profession_input.setText(_existing_on_open["profession"] or "")
 
         # Wire live validation AFTER fields are set to avoid spurious errors.
-        self.name_input.textChanged.connect(self._validate_name_live)
-        self._validate_name_live(self.name_input.text())
+        self.last_name_input.textChanged.connect(self._on_name_part_changed)
+        self.first_name_input.textChanged.connect(self._on_name_part_changed)
+        self.middle_initial_input.textChanged.connect(self._on_name_part_changed)
+        self._validate_name_live(self._compose_name())
 
     # ── UI construction ────────────────────────────────────────────────────────
 
@@ -525,17 +553,38 @@ class RegisterParticipantDialog(QDialog):
             lbl.setTextFormat(Qt.RichText)
             return lbl
 
-        # ── Name field ──
-        form_layout.addWidget(_req_label("Full Name"))
-        self.name_input = QLineEdit()
-        self.name_input.setPlaceholderText("e.g. Juan dela Cruz")
-        _existing_names = [p["name"] for p in self.storage.get_all_participants()]
-        _dlg_completer = QCompleter(_existing_names, self.name_input)
-        _dlg_completer.setCaseSensitivity(Qt.CaseInsensitive)
-        _dlg_completer.setFilterMode(Qt.MatchContains)
-        _dlg_completer.setCompletionMode(QCompleter.PopupCompletion)
-        self.name_input.setCompleter(_dlg_completer)
-        form_layout.addWidget(self.name_input)
+        # ── Name fields (Last / First / MI) ──
+        name_row = QHBoxLayout()
+        name_row.setSpacing(8)
+
+        last_col = QVBoxLayout()
+        last_col.setSpacing(4)
+        last_col.addWidget(_req_label("Last Name"))
+        self.last_name_input = QLineEdit()
+        self.last_name_input.setPlaceholderText("e.g. Joaquin")
+        last_col.addWidget(self.last_name_input)
+        name_row.addLayout(last_col, stretch=3)
+
+        first_col = QVBoxLayout()
+        first_col.setSpacing(4)
+        first_col.addWidget(_req_label("First Name"))
+        self.first_name_input = QLineEdit()
+        self.first_name_input.setPlaceholderText("e.g. Charles June")
+        first_col.addWidget(self.first_name_input)
+        name_row.addLayout(first_col, stretch=3)
+
+        mi_col = QVBoxLayout()
+        mi_col.setSpacing(4)
+        mi_lbl = QLabel("MI  <span style='color:#7a9ab8; font-size:10px;'>(opt.)</span>")
+        mi_lbl.setTextFormat(Qt.RichText)
+        mi_col.addWidget(mi_lbl)
+        self.middle_initial_input = QLineEdit()
+        self.middle_initial_input.setPlaceholderText("e.g. S")
+        self.middle_initial_input.setMaxLength(2)
+        mi_col.addWidget(self.middle_initial_input)
+        name_row.addLayout(mi_col, stretch=1)
+
+        form_layout.addLayout(name_row)
 
         # Inline duplicate / required error — hidden until a problem is detected.
         self._name_error_label = QLabel()
@@ -684,29 +733,56 @@ class RegisterParticipantDialog(QDialog):
             self.ok_btn.setText("Register")
             self.ok_btn.setEnabled(True)
 
+    def _compose_name(self) -> str:
+        """Build the canonical stored name from the three input fields.
+        Format: 'LastName, FirstName [MI.]'  (MI is optional)."""
+        last  = self.last_name_input.text().strip()
+        first = self.first_name_input.text().strip()
+        mi    = self.middle_initial_input.text().strip().rstrip(".")
+        if not last and not first:
+            return ""
+        first_part = first
+        if mi:
+            first_part = f"{first} {mi}." if first else f"{mi}."
+        if last and first_part:
+            return f"{last}, {first_part}"
+        return last or first_part
+
+    def _on_name_part_changed(self) -> None:
+        self._validate_name_live(self._compose_name())
+
     def _show_name_error(self, html: str) -> None:
         self._name_error_label.setText(html)
         self._name_error_label.show()
-        self.name_input.setStyleSheet("border: 1.5px solid #ef4444;")
+        self.last_name_input.setStyleSheet("border: 1.5px solid #ef4444;")
+        self.first_name_input.setStyleSheet("border: 1.5px solid #ef4444;")
         self.adjustSize()
 
     def _clear_name_error(self) -> None:
         self._name_error_label.hide()
         self._name_error_label.clear()
-        self.name_input.setStyleSheet("")
+        self.last_name_input.setStyleSheet("")
+        self.first_name_input.setStyleSheet("")
 
     # ── Submit ─────────────────────────────────────────────────────────────────
 
     def _on_accept(self) -> None:
-        name = self.name_input.text().strip()
+        name = self._compose_name()
 
-        # Required-field: name
-        if not name:
+        # Required-field: last name and first name
+        if not self.last_name_input.text().strip():
             self._show_name_error(
-                "<b>\u26a0\ufe0f &nbsp;Name is required.</b>"
-                " Please enter the participant\u2019s full name."
+                "<b>\u26a0\ufe0f &nbsp;Last name is required.</b>"
+                " Please enter the participant\u2019s last name."
             )
-            self.name_input.setFocus()
+            self.last_name_input.setFocus()
+            return
+        if not self.first_name_input.text().strip():
+            self._show_name_error(
+                "<b>\u26a0\ufe0f &nbsp;First name is required.</b>"
+                " Please enter the participant\u2019s first name."
+            )
+            self.first_name_input.setFocus()
             return
 
         # Required-field: gender
@@ -722,7 +798,7 @@ class RegisterParticipantDialog(QDialog):
         )
         if not is_editing_self and self.storage.get_participant_ci(name):
             self._validate_name_live(name)   # re-show the inline error
-            self.name_input.setFocus()
+            self.last_name_input.setFocus()
             return
 
         age        = self.age_spin.value()
@@ -735,7 +811,7 @@ class RegisterParticipantDialog(QDialog):
     def get_values(self):
         """Convenience accessor after accept()."""
         return (
-            self.name_input.text().strip(),
+            self._compose_name(),
             self.age_spin.value(),
             self.gender_combo.currentText(),
             self.profession_input.text().strip(),

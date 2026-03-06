@@ -12,12 +12,21 @@ class SerialHandler:
     def connect(self):
         self.last_error = ""
         try:
-            self.serial_connection = serial.Serial(
-                self.port,
-                self.baudrate,
-                timeout=0,        # non-blocking — never stalls the UI thread
-                write_timeout=1,
-            )
+            # Build the Serial object without opening it first so we can clear
+            # the DTR line before the port opens.  When DTR goes LOW→HIGH on
+            # open it triggers the Arduino hardware reset (via the 100 nF cap on
+            # the RESET pin), which re-runs setup(), blanks the LCD, plays the
+            # startup beeps, and discards any in-flight state.  Setting dtr=False
+            # keeps the line stable and lets the PING/HELLO handshake handle sync
+            # instead.  Only USB-CDC boards (Uno, Mega, Nano) are affected; the
+            # flag is harmless for any other adapter.
+            self.serial_connection = serial.Serial()
+            self.serial_connection.port         = self.port
+            self.serial_connection.baudrate     = self.baudrate
+            self.serial_connection.timeout      = 0   # non-blocking — never stalls the UI thread
+            self.serial_connection.write_timeout = 1
+            self.serial_connection.dtr          = False   # hold DTR low before open → no reset
+            self.serial_connection.open()
             self._recv_buf = b""
         except serial.SerialException as e:
             self.last_error = str(e)

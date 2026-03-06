@@ -500,6 +500,23 @@ class MainWindow(QMainWindow):
         self.connection_status.setObjectName("InlineStatus")
         self.connection_status.setMinimumHeight(26)
         setup_layout.addWidget(self.connection_status)
+
+        mode_divider = QFrame()
+        mode_divider.setFrameShape(QFrame.HLine)
+        mode_divider.setObjectName("SetupDivider")
+        setup_layout.addWidget(mode_divider)
+
+        setup_layout.addWidget(QLabel("Test Mode"))
+        self.test_mode_combo = QComboBox()
+        self.test_mode_combo.setToolTip(
+            "Visual: green LED flashes as the GO signal.\n"
+            "Auditory: buzzer beeps as the GO signal.\n"
+            "Both: LED flash + buzzer beep simultaneously."
+        )
+        self.test_mode_combo.addItem("Both (Visual + Auditory)", userData="BOTH")
+        self.test_mode_combo.addItem("Visual Only  (LED)",        userData="VISUAL")
+        self.test_mode_combo.addItem("Auditory Only  (Buzzer)",   userData="AUDIO")
+        setup_layout.addWidget(self.test_mode_combo)
         setup_layout.addStretch(1)
 
         # ── Right: Reaction Test ──────────────────────────────────────────────
@@ -898,6 +915,7 @@ class MainWindow(QMainWindow):
             f"{name} is ready. Connect Arduino and start the test.",
             "success",
         )
+        self._announce_participant_to_arduino()
         self._update_participant_chip()
         self._sync_start_button_state()
         self._refresh_name_completer()
@@ -929,6 +947,7 @@ class MainWindow(QMainWindow):
             f"{name} loaded from registry. Connect Arduino and start the test.",
             "success",
         )
+        self._announce_participant_to_arduino()
         self._update_participant_chip()
         self._sync_start_button_state()
         self._refresh_name_completer()
@@ -1078,6 +1097,29 @@ class MainWindow(QMainWindow):
         if self.serial_handler and self.serial_handler.is_connected() and not self._arduino_ready:
             self.serial_handler.send_data("PING\n")
 
+    @staticmethod
+    def _format_lcd_name(stored_name: str) -> str:
+        """Convert 'LastName, FirstName [MI]' to the 16-char LCD format 'LastName, First'.
+        Falls back gracefully for legacy names that don't contain ', '."""
+        if ", " in stored_name:
+            last, rest = stored_name.split(", ", 1)
+            first_word = rest.split()[0] if rest.strip() else rest
+            return f"{last}, {first_word}"[:16]
+        return stored_name[:16]
+
+    def _announce_participant_to_arduino(self):
+        """Send NAME:<name> to show the active participant on the LCD when idle.
+        Only sent when the Arduino is ready and no session is running."""
+        if not (self.serial_handler and self.serial_handler.is_connected()):
+            return
+        if not self._arduino_ready:
+            return
+        if self.session_active or self.test_in_progress:
+            return
+        if self.current_participant:
+            safe_name = self._format_lcd_name(self.current_participant).replace("\n", "").replace("\r", "")
+            self.serial_handler.send_data(f"NAME:{safe_name}\n")
+
     def start_test(self):
         participant_name = self.name_input.text().strip()
         if not participant_name or participant_name != self.current_participant:
@@ -1117,10 +1159,15 @@ class MainWindow(QMainWindow):
         self._update_trial_status()
         self._update_session_chip()
         self._sync_start_button_state()
+        # Send the selected test mode to the Arduino before anything else so
+        # the correct stimulus fires for every trial in this session.
+        mode = self.test_mode_combo.currentData()
+        self.serial_handler.send_data(f"MODE:{mode}\n")
+
         # Tell Arduino who the participant is and that the session has begun.
         # Arduino will show the name on LCD; delay 800 ms before first S so
         # the participant name / Session Start screen is visible briefly.
-        safe_name = participant_name[:16].replace("\n", "").replace("\r", "")
+        safe_name = self._format_lcd_name(participant_name).replace("\n", "").replace("\r", "")
         self.serial_handler.send_data(f"BEGIN:{safe_name}\n")
         QTimer.singleShot(800, self._start_next_trial)
 
@@ -1163,7 +1210,7 @@ class MainWindow(QMainWindow):
         if len(self.session_results) >= SESSION_TRIALS:
             self._finish_session()
             return
-        QTimer.singleShot(900, self._start_next_trial)
+        QTimer.singleShot(2500, self._start_next_trial)
 
     def _finish_session(self, aborted=False):
         participant_name = self.current_participant or self.name_input.text().strip() or "Unknown"
@@ -1262,12 +1309,20 @@ class MainWindow(QMainWindow):
                 "Arduino is ready and waiting. Press START TEST to begin.", "success"
             )
             self._set_signal_state("idle", "READY", "Waiting for START TEST button.")
+            self._announce_participant_to_arduino()
             self._sync_start_button_state()
             return
         if value == "ARMED":
+            mode = self.test_mode_combo.currentData()
+            if mode == "AUDIO":
+                cue_hint = "wait for the buzzer beep."
+            elif mode == "VISUAL":
+                cue_hint = "wait for the green LED flash."
+            else:
+                cue_hint = "wait for the LED + buzzer GO signal."
             self._set_signal_state("ready", "READY", "Wait for GO signal.")
             self._set_feedback(
-                f"Trial {self.current_trial}/{SESSION_TRIALS}: ready... wait for LED signal.",
+                f"Trial {self.current_trial}/{SESSION_TRIALS}: ready — {cue_hint}",
                 "active",
             )
             return
@@ -1289,18 +1344,16 @@ class MainWindow(QMainWindow):
             )
             return
         if value == "TIMEOUT":
-            self.test_in_progress = False
             self._go_received_at = None
-            self.session_results.append(None)
-            self._set_signal_state("warning", "MISSED", "No response captured in time.")
+            self._set_signal_state("warning", "MISSED", "Retrying trial…")
             self._set_feedback(
-                f"Trial {self.current_trial}/{SESSION_TRIALS}: timeout. Preparing next trial.",
+                f"Trial {self.current_trial}/{SESSION_TRIALS}: timeout — retrying same trial.",
                 "warning",
             )
             self._set_live_result(None, "warning", "Latest reaction: timeout")
             self._update_trial_status()
             self._update_session_chip()
-            self._queue_next_trial_or_finish()
+            # test_in_progress stays True — Arduino re-arms the same trial automatically.
             self._sync_start_button_state()
             return
         if value in {"EARLY", "TOO_SOON"}:
